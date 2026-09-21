@@ -3,11 +3,7 @@ import sqlite3
 import logging
 from typing import Optional
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
@@ -26,10 +22,6 @@ BOT_NAME = "Global Cash Bot"
 BOT_USERNAME = "GloballCashh_Bot"
 SUPPORT_USERNAME = "AmanM_12"
 
-# =========================================================
-# REQUIRED CHANNELS
-# =========================================================
-
 REQUIRED_CHANNELS = [
     ("@Sheger_tech1", "Sheger Tech"),
     ("@EthioVortex1", "Ethio Vortex"),
@@ -39,14 +31,9 @@ REQUIRED_CHANNELS = [
     ("@Paymentprooff2", "Payment Proof"),
 ]
 
-# =========================================================
-# BOT SETTINGS
-# =========================================================
-
 REFERRAL_REWARD = 2.0
 MIN_WITHDRAW = 30.0
 CURRENCY = "ETB"
-
 DB_FILE = "global_cash.db"
 
 logging.basicConfig(
@@ -77,7 +64,9 @@ def init_db():
             balance REAL DEFAULT 0,
             referred_by INTEGER,
             referral_paid INTEGER DEFAULT 0,
+            referral_status TEXT DEFAULT 'pending',
             joined_all INTEGER DEFAULT 0,
+            suspicious INTEGER DEFAULT 0,
             wallet_type TEXT,
             wallet_number TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -96,44 +85,48 @@ def init_db():
         )
     """)
 
-    # New anti-abuse columns.
-    # Safe for existing databases.
-    columns = [
-        ("referral_status", "TEXT DEFAULT 'none'"),
-        ("suspicious", "INTEGER DEFAULT 0"),
-    ]
+    # Migration for older database versions
+    existing_columns = set()
 
-    for column_name, column_type in columns:
-        try:
-            cur.execute(
-                f"ALTER TABLE users ADD COLUMN {column_name} {column_type}"
-            )
-        except sqlite3.OperationalError:
-            pass
+    cur.execute("PRAGMA table_info(users)")
+    for row in cur.fetchall():
+        existing_columns.add(row[1])
 
-    # Unique wallet protection.
-    # If an old database already contains duplicate wallets,
-    # the index may fail; manual checking below still protects new wallets.
-    try:
-        cur.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_unique_wallet
-            ON users(wallet_type, wallet_number)
-            WHERE wallet_type IS NOT NULL
-            AND wallet_number IS NOT NULL
-            AND wallet_number != ''
-        """)
-    except sqlite3.IntegrityError:
-        logger.warning(
-            "Duplicate old wallets detected. "
-            "Manual wallet checking remains active."
+    if "referral_status" not in existing_columns:
+        cur.execute(
+            "ALTER TABLE users ADD COLUMN referral_status TEXT DEFAULT 'pending'"
         )
-    except sqlite3.OperationalError:
-        pass
+
+    if "suspicious" not in existing_columns:
+        cur.execute(
+            "ALTER TABLE users ADD COLUMN suspicious INTEGER DEFAULT 0"
+        )
 
     conn.commit()
+
+    # Try to create unique wallet index.
+    # If old database contains duplicate wallets, don't crash the bot.
+    try:
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_wallet
+            ON users(wallet_type, wallet_number)
+            WHERE wallet_type IS NOT NULL
+              AND wallet_number IS NOT NULL
+              AND wallet_number != ''
+        """)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        logger.warning(
+            "Duplicate wallets exist in old database. "
+            "Manual duplicate-wallet protection will still work."
+        )
+
     conn.close()
 
+
+# =========================================================
+# USER FUNCTIONS
+# =========================================================
 
 def get_user(user_id: int):
     conn = db()
@@ -159,10 +152,14 @@ def create_user(
     conn = db()
     cur = conn.cursor()
 
-    # Do not allow changing the original referrer later.
     cur.execute("""
         INSERT OR IGNORE INTO users
-        (user_id, username, first_name, referred_by)
+        (
+            user_id,
+            username,
+            first_name,
+            referred_by
+        )
         VALUES (?, ?, ?, ?)
     """, (
         user_id,
@@ -267,11 +264,10 @@ def is_suspicious(user_id: int) -> bool:
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("""
-        SELECT suspicious
-        FROM users
-        WHERE user_id = ?
-    """, (user_id,))
+    cur.execute(
+        "SELECT suspicious FROM users WHERE user_id = ?",
+        (user_id,)
+    )
 
     row = cur.fetchone()
     conn.close()
@@ -282,90 +278,6 @@ def is_suspicious(user_id: int) -> bool:
 # =========================================================
 # WALLET
 # =========================================================
-
-def wallet_exists(
-    wallet_type: str,
-    wallet_number: str,
-    except_user_id: Optional[int] = None
-) -> bool:
-
-    conn = db()
-    cur = conn.cursor()
-
-    if except_user_id is not None:
-        cur.execute("""
-            SELECT user_id
-            FROM users
-            WHERE wallet_type = ?
-            AND wallet_number = ?
-            AND user_id != ?
-            LIMIT 1
-        """, (
-            wallet_type,
-            wallet_number,
-            except_user_id
-        ))
-    else:
-        cur.execute("""
-            SELECT user_id
-            FROM users
-            WHERE wallet_type = ?
-            AND wallet_number = ?
-            LIMIT 1
-        """, (
-            wallet_type,
-            wallet_number
-        ))
-
-    row = cur.fetchone()
-    conn.close()
-
-    return row is not None
-
-
-def set_wallet(
-    user_id: int,
-    wallet_type: str,
-    wallet_number: str
-) -> bool:
-
-    if wallet_exists(
-        wallet_type,
-        wallet_number,
-        except_user_id=user_id
-    ):
-        return False
-
-    conn = db()
-    cur = conn.cursor()
-
-    try:
-        cur.execute("""
-            UPDATE users
-            SET wallet_type = ?, wallet_number = ?
-            WHERE user_id = ?
-        """, (
-            wallet_type,
-            wallet_number,
-            user_id
-        ))
-
-        conn.commit()
-
-    except sqlite3.IntegrityError:
-        conn.rollback()
-        conn.close()
-        return False
-
-    conn.close()
-
-    # Wallet is now saved.
-    # If a referral was waiting for wallet verification,
-    # process it.
-    process_pending_referral(user_id)
-
-    return True
-
 
 def get_wallet(user_id: int):
     conn = db()
@@ -383,8 +295,75 @@ def get_wallet(user_id: int):
     return row
 
 
+def wallet_exists_for_other_user(
+    wallet_type: str,
+    wallet_number: str,
+    user_id: int
+) -> bool:
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT user_id
+        FROM users
+        WHERE wallet_type = ?
+          AND wallet_number = ?
+          AND user_id != ?
+        LIMIT 1
+    """, (
+        wallet_type,
+        wallet_number,
+        user_id
+    ))
+
+    row = cur.fetchone()
+    conn.close()
+
+    return row is not None
+
+
+def set_wallet(
+    user_id: int,
+    wallet_type: str,
+    wallet_number: str
+) -> bool:
+
+    if wallet_exists_for_other_user(
+        wallet_type,
+        wallet_number,
+        user_id
+    ):
+        mark_suspicious(user_id)
+        return False
+
+    conn = db()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("""
+            UPDATE users
+            SET wallet_type = ?, wallet_number = ?
+            WHERE user_id = ?
+        """, (
+            wallet_type,
+            wallet_number,
+            user_id
+        ))
+
+        conn.commit()
+        return True
+
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        mark_suspicious(user_id)
+        return False
+
+    finally:
+        conn.close()
+
+
 # =========================================================
-# REFERRAL SYSTEM
+# REFERRAL
 # =========================================================
 
 def get_referral_count(user_id: int) -> int:
@@ -395,13 +374,29 @@ def get_referral_count(user_id: int) -> int:
         SELECT COUNT(*)
         FROM users
         WHERE referred_by = ?
-        AND referral_paid = 1
+          AND referral_paid = 1
     """, (user_id,))
 
     count = cur.fetchone()[0]
     conn.close()
 
     return count
+
+
+def get_referrer(user_id: int):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT referred_by, referral_paid, referral_status
+        FROM users
+        WHERE user_id = ?
+    """, (user_id,))
+
+    row = cur.fetchone()
+    conn.close()
+
+    return row
 
 
 def set_referral_status(
@@ -424,29 +419,15 @@ def set_referral_status(
     conn.close()
 
 
-def process_referral_reward(
-    user_id: int
-):
-    """
-    Referral reward is paid only when:
-    1. The new user completed verification.
-    2. The referral is valid.
-    3. The new user's wallet is saved.
-    4. The wallet is not already used by another account.
-    5. The inviter is not the same account.
-    6. The referral has not already been paid.
-    """
-
+def process_referral_reward(user_id: int):
     conn = db()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT
-            referred_by,
-            referral_paid,
-            joined_all,
-            wallet_type,
-            wallet_number
+        SELECT referred_by,
+               referral_paid,
+               referral_status,
+               suspicious
         FROM users
         WHERE user_id = ?
     """, (user_id,))
@@ -457,74 +438,68 @@ def process_referral_reward(
         conn.close()
         return None
 
-    (
-        referred_by,
-        referral_paid,
-        joined_all,
-        wallet_type,
-        wallet_number
-    ) = row
+    referred_by, referral_paid, referral_status, suspicious = row
 
-    if not referred_by:
-        conn.close()
-        return None
-
-    if referred_by == user_id:
-        conn.close()
-        mark_suspicious(user_id)
-        return None
-
+    # Already paid
     if referral_paid:
         conn.close()
         return None
 
-    if not joined_all:
+    # No inviter
+    if not referred_by:
         conn.close()
         return None
 
-    # Wallet is required before referral reward.
-    if not wallet_type or not wallet_number:
+    # Self referral protection
+    if int(referred_by) == int(user_id):
+        cur.execute("""
+            UPDATE users
+            SET suspicious = 1,
+                referral_status = 'blocked'
+            WHERE user_id = ?
+        """, (user_id,))
+
+        conn.commit()
         conn.close()
-        set_referral_status(user_id, "pending_wallet")
         return None
 
-    # Make sure the same wallet is not linked
-    # to another Telegram account.
+    # Suspicious referred account
+    if suspicious:
+        cur.execute("""
+            UPDATE users
+            SET referral_status = 'blocked'
+            WHERE user_id = ?
+        """, (user_id,))
+
+        conn.commit()
+        conn.close()
+        return None
+
+    # Check inviter exists
     cur.execute("""
-        SELECT user_id
-        FROM users
-        WHERE wallet_type = ?
-        AND wallet_number = ?
-        AND user_id != ?
-        LIMIT 1
-    """, (
-        wallet_type,
-        wallet_number,
-        user_id
-    ))
-
-    wallet_owner = cur.fetchone()
-
-    if wallet_owner:
-        conn.close()
-        mark_suspicious(user_id)
-        set_referral_status(user_id, "blocked_duplicate_wallet")
-        return None
-
-    # Check inviter exists.
-    cur.execute("""
-        SELECT user_id
+        SELECT user_id, suspicious
         FROM users
         WHERE user_id = ?
     """, (referred_by,))
 
-    inviter_exists = cur.fetchone()
+    inviter = cur.fetchone()
 
-    if not inviter_exists:
+    if not inviter:
         conn.close()
         return None
 
-    # Pay inviter.
+    if inviter[1]:
+        cur.execute("""
+            UPDATE users
+            SET referral_status = 'blocked'
+            WHERE user_id = ?
+        """, (user_id,))
+
+        conn.commit()
+        conn.close()
+        return None
+
+    # Pay referral
     cur.execute("""
         UPDATE users
         SET balance = balance + ?
@@ -534,7 +509,6 @@ def process_referral_reward(
         referred_by
     ))
 
-    # Mark referral paid.
     cur.execute("""
         UPDATE users
         SET referral_paid = 1,
@@ -546,16 +520,6 @@ def process_referral_reward(
     conn.close()
 
     return referred_by
-
-
-def process_pending_referral(user_id: int):
-    """
-    Called after a wallet is successfully saved.
-    """
-
-    inviter = process_referral_reward(user_id)
-
-    return inviter
 
 
 # =========================================================
@@ -573,7 +537,12 @@ def create_withdrawal(
 
     cur.execute("""
         INSERT INTO withdrawals
-        (user_id, amount, wallet_type, wallet_number)
+        (
+            user_id,
+            amount,
+            wallet_type,
+            wallet_number
+        )
         VALUES (?, ?, ?, ?)
     """, (
         user_id,
@@ -634,7 +603,6 @@ async def get_missing_channels(
     missing = []
 
     for username, name in REQUIRED_CHANNELS:
-
         joined = await check_channel_membership(
             context,
             user_id,
@@ -669,6 +637,72 @@ def channel_keyboard(missing_channels):
 
 
 # =========================================================
+# MAIN MENU
+# =========================================================
+
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💰 Balance",
+                callback_data="balance"
+            ),
+            InlineKeyboardButton(
+                "👥 Referral",
+                callback_data="referral"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 Tasks",
+                callback_data="tasks"
+            ),
+            InlineKeyboardButton(
+                "💳 Withdraw",
+                callback_data="withdraw"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "👛 Wallet",
+                callback_data="wallet"
+            ),
+            InlineKeyboardButton(
+                "🆘 Support",
+                callback_data="support"
+            ),
+        ],
+    ])
+
+
+async def send_main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    text = (
+        f"🎉 <b>{BOT_NAME}</b>\n\n"
+        "✅ <b>Account Verified</b>\n\n"
+        "💰 Earn ETB through referrals "
+        "and available activities.\n\n"
+        "👇 <b>Select an option:</b>"
+    )
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=main_keyboard(),
+            parse_mode="HTML"
+        )
+    else:
+        await update.message.reply_text(
+            text,
+            reply_markup=main_keyboard(),
+            parse_mode="HTML"
+        )
+
+
+# =========================================================
 # START
 # =========================================================
 
@@ -690,6 +724,12 @@ async def start(
 
         except ValueError:
             pass
+
+    existing_user = get_user(user.id)
+
+    # Don't overwrite an existing referral
+    if existing_user:
+        referred_by = existing_user[4]
 
     create_user(
         user.id,
@@ -713,9 +753,9 @@ async def start(
 
         text = (
             f"👋 <b>Welcome to {BOT_NAME}</b>\n\n"
-            "💰 የማግኘት ስርዓቱን ለመጀመር "
+            "💰 የearning system ለመጀመር "
             "ከታች ያሉትን channels በሙሉ Join ያድርጉ።\n\n"
-            "👇 ሁሉንም channels ከጨረሱ በኋላ "
+            "👇 ሁሉንም ከጨረሱ በኋላ "
             "<b>Verify</b> ይጫኑ።"
         )
 
@@ -729,72 +769,10 @@ async def start(
 
     set_joined_all(user.id, 1)
 
-    await send_main_menu(update, context)
-
-
-# =========================================================
-# MAIN MENU
-# =========================================================
-
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "💰 Balance",
-                callback_data="balance"
-            ),
-            InlineKeyboardButton(
-                "👥 Referral",
-                callback_data="referral"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📋 Tasks",
-                callback_data="tasks"
-            ),
-            InlineKeyboardButton(
-                "💳 Withdraw",
-                callback_data="withdraw"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👛 Wallet",
-                callback_data="wallet"
-            ),
-            InlineKeyboardButton(
-                "🆘 Support",
-                callback_data="support"
-            )
-        ],
-    ])
-
-
-async def send_main_menu(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    text = (
-        f"🎉 <b>Welcome to {BOT_NAME}</b>\n\n"
-        "✅ <b>Verified Account</b>\n"
-        "💰 Earn ETB through Referrals & Tasks.\n\n"
-        "👇 <b>Choose your option:</b>"
+    await send_main_menu(
+        update,
+        context
     )
-
-    if update.callback_query:
-        await update.callback_query.edit_message_text(
-            text,
-            reply_markup=main_keyboard(),
-            parse_mode="HTML"
-        )
-    else:
-        await update.message.reply_text(
-            text,
-            reply_markup=main_keyboard(),
-            parse_mode="HTML"
-        )
 
 
 # =========================================================
@@ -825,7 +803,7 @@ async def verify(
 
         text = (
             "⚠️ <b>Verification Failed</b>\n\n"
-            "እነዚህ channels ገና Join አላደረጉም፦\n\n"
+            "እነዚህ channels ገና አልተጠናቀቁም፦\n\n"
             f"{names}\n\n"
             "ከJoin በኋላ <b>Verify</b> እንደገና ይጫኑ።"
         )
@@ -838,11 +816,15 @@ async def verify(
 
         return
 
-    set_joined_all(user_id, 1)
+    set_joined_all(
+        user_id,
+        1
+    )
 
-    # Try referral reward.
-    # If wallet is not saved yet, it becomes pending.
-    inviter = process_referral_reward(user_id)
+    # Referral reward
+    inviter = process_referral_reward(
+        user_id
+    )
 
     if inviter:
 
@@ -851,20 +833,22 @@ async def verify(
                 chat_id=inviter,
                 text=(
                     "🎉 <b>Referral Reward!</b>\n\n"
-                    "እርስዎ የጋበዙት user verification አጠናቋል።\n\n"
+                    "Someone you referred completed verification.\n\n"
                     f"💰 <b>+{REFERRAL_REWARD:.2f} ETB</b>\n"
-                    "በBalance ላይ ተጨምሯል።"
+                    "has been added to your balance."
                 ),
                 parse_mode="HTML"
             )
-        except Exception:
-            pass
+
+        except Exception as e:
+            logger.warning(
+                "Referral notification failed: %s",
+                e
+            )
 
     await query.edit_message_text(
         "✅ <b>Verified Successfully!</b>\n\n"
-        "🎉 Welcome to Global Cash Bot.\n\n"
-        "💡 Referral reward ለመክፈል የተጠቃሚው wallet "
-        "እንዲሁም ይመረጣል።",
+        "🎉 Welcome to Global Cash Bot.",
         parse_mode="HTML"
     )
 
@@ -888,38 +872,35 @@ async def show_balance(
     query = update.callback_query
     await query.answer()
 
-    balance = get_balance(query.from_user.id)
+    balance = get_balance(
+        query.from_user.id
+    )
 
     text = (
         "💰 <b>Your Balance</b>\n\n"
-        "💵 Available Balance\n"
-        f"<b>{balance:.2f} ETB</b>\n\n"
-        f"🎯 Minimum Withdraw: <b>{MIN_WITHDRAW:.2f} ETB</b>\n\n"
-        "Earn more through Referrals & Tasks."
+        f"💵 Available: <b>{balance:.2f} ETB</b>\n\n"
+        f"📌 Minimum Withdrawal: "
+        f"<b>{MIN_WITHDRAW:.2f} ETB</b>"
     )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💳 Withdraw",
+                callback_data="withdraw"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="home"
+            )
+        ],
+    ])
 
     await query.edit_message_text(
         text,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "💳 Withdraw",
-                    callback_data="withdraw"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "👥 Earn with Referral",
-                    callback_data="referral"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="home"
-                )
-            ]
-        ]),
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
 
@@ -938,30 +919,32 @@ async def show_referral(
 
     user_id = query.from_user.id
 
-    count = get_referral_count(user_id)
+    count = get_referral_count(
+        user_id
+    )
 
     me = await context.bot.get_me()
 
     referral_link = (
-        f"https://t.me/{me.username}?start={user_id}"
+        f"https://t.me/{me.username}"
+        f"?start={user_id}"
     )
 
     text = (
         "👥 <b>Referral Program</b>\n\n"
-        "🤝 Friends invite አድርገው ETB ያግኙ!\n\n"
         f"👤 Successful Referrals: <b>{count}</b>\n"
-        f"💰 Per Verified Referral: "
+        f"💰 Reward per referral: "
         f"<b>{REFERRAL_REWARD:.2f} ETB</b>\n\n"
         "🔗 <b>Your Referral Link</b>\n"
         f"<code>{referral_link}</code>\n\n"
-        "📌 Reward የሚከፈለው ከverification በኋላ "
-        "እና wallet በትክክል ከተረጋገጠ ብቻ ነው።"
+        "⚠️ Reward is added only after "
+        "the referred user completes verification."
     )
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "📤 Share Referral Link",
+                "📤 Share Link",
                 url=(
                     "https://t.me/share/url"
                     f"?url={referral_link}"
@@ -971,16 +954,10 @@ async def show_referral(
         ],
         [
             InlineKeyboardButton(
-                "💰 My Balance",
-                callback_data="balance"
-            )
-        ],
-        [
-            InlineKeyboardButton(
                 "🔙 Back",
                 callback_data="home"
             )
-        ]
+        ],
     ])
 
     await query.edit_message_text(
@@ -1003,31 +980,32 @@ async def show_tasks(
     await query.answer()
 
     text = (
-        "📋 <b>Tasks Center</b>\n\n"
-        "🚀 New earning tasks are coming soon.\n\n"
-        "👥 <b>Available Now</b>\n"
-        "Invite friends and earn "
+        "📋 <b>Tasks</b>\n\n"
+        "🎯 <b>Available Task</b>\n\n"
+        "👥 Invite friends and earn "
         f"<b>{REFERRAL_REWARD:.2f} ETB</b> "
-        "for each eligible referral.\n\n"
-        "🔥 Keep checking for new tasks."
+        "for each successful referral.\n\n"
+        "🚀 More earning tasks will be added soon."
     )
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "👥 Referral",
+                callback_data="referral"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="home"
+            )
+        ],
+    ])
 
     await query.edit_message_text(
         text,
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "👥 Referral",
-                    callback_data="referral"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🔙 Back",
-                    callback_data="home"
-                )
-            ]
-        ]),
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
 
@@ -1044,23 +1022,25 @@ async def show_wallet(
     query = update.callback_query
     await query.answer()
 
-    wallet = get_wallet(query.from_user.id)
+    wallet = get_wallet(
+        query.from_user.id
+    )
 
     if wallet and wallet[0] and wallet[1]:
 
         text = (
             "👛 <b>Your Wallet</b>\n\n"
-            f"💳 Method: <b>{wallet[0]}</b>\n"
+            f"💳 Type: <b>{wallet[0]}</b>\n"
             f"🔢 Number: <code>{wallet[1]}</code>\n\n"
-            "✅ Wallet saved successfully."
+            "Choose another wallet if you want to update it."
         )
 
     else:
 
         text = (
-            "👛 <b>Your Wallet</b>\n\n"
-            "⚠️ No wallet saved yet.\n\n"
-            "Choose your payment method:"
+            "👛 <b>Wallet</b>\n\n"
+            "❌ No wallet saved yet.\n\n"
+            "👇 Select your payment method:"
         )
 
     keyboard = InlineKeyboardMarkup([
@@ -1072,14 +1052,14 @@ async def show_wallet(
             InlineKeyboardButton(
                 "📱 Telebirr",
                 callback_data="wallet_telebirr"
-            )
+            ),
         ],
         [
             InlineKeyboardButton(
                 "🔙 Back",
                 callback_data="home"
             )
-        ]
+        ],
     ])
 
     await query.edit_message_text(
@@ -1088,10 +1068,6 @@ async def show_wallet(
         parse_mode="HTML"
     )
 
-
-# =========================================================
-# WALLET SETUP
-# =========================================================
 
 async def wallet_cbe(
     update: Update,
@@ -1103,12 +1079,22 @@ async def wallet_cbe(
 
     context.user_data["wallet_setup"] = "CBE"
 
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="wallet"
+            )
+        ]
+    ])
+
     await query.edit_message_text(
         "🏦 <b>CBE Wallet</b>\n\n"
         "የCBE account number ያስገቡ።\n\n"
-        "📌 13 digits መሆን እና <b>1000</b> በሚል "
-        "መጀመር አለበት።\n\n"
-        "❌ Cancel: /cancel",
+        "📌 13 digits መሆን አለበት።\n"
+        "📌 1000 በሚል መጀመር አለበት።\n\n"
+        "ካልፈለጉ ከታች <b>Back</b> ይጫኑ።",
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
 
@@ -1123,12 +1109,22 @@ async def wallet_telebirr(
 
     context.user_data["wallet_setup"] = "Telebirr"
 
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="wallet"
+            )
+        ]
+    ])
+
     await query.edit_message_text(
         "📱 <b>Telebirr Wallet</b>\n\n"
         "የTelebirr phone number ያስገቡ።\n\n"
-        "📌 10 digits እና <b>09</b> ወይም <b>07</b> "
-        "በሚል መጀመር አለበት።\n\n"
-        "❌ Cancel: /cancel",
+        "📌 10 digits መሆን አለበት።\n"
+        "📌 09 ወይም 07 በሚል መጀመር አለበት።\n\n"
+        "ካልፈለጉ ከታች <b>Back</b> ይጫኑ።",
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
 
@@ -1145,21 +1141,47 @@ async def withdraw(
     query = update.callback_query
     await query.answer()
 
-    balance = get_balance(query.from_user.id)
-    wallet = get_wallet(query.from_user.id)
+    user_id = query.from_user.id
+
+    if is_suspicious(user_id):
+
+        await query.edit_message_text(
+            "🛡️ <b>Security Review</b>\n\n"
+            "Your account is currently under security review.\n\n"
+            "Withdrawal is temporarily unavailable.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🆘 Support",
+                        callback_data="support"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🔙 Back",
+                        callback_data="home"
+                    )
+                ],
+            ]),
+            parse_mode="HTML"
+        )
+
+        return
+
+    balance = get_balance(user_id)
+    wallet = get_wallet(user_id)
 
     if balance < MIN_WITHDRAW:
 
         await query.edit_message_text(
-            "💳 <b>Withdraw</b>\n\n"
-            "⚠️ እስካሁን ለWithdrawal በቂ Balance የለዎትም።\n\n"
+            "❌ <b>Insufficient Balance</b>\n\n"
             f"💰 Your Balance: <b>{balance:.2f} ETB</b>\n"
-            f"🎯 Minimum: <b>{MIN_WITHDRAW:.2f} ETB</b>\n\n"
-            "💡 Keep earning and reach the minimum.",
+            f"💳 Minimum: <b>{MIN_WITHDRAW:.2f} ETB</b>\n\n"
+            "Keep earning and try again later.",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "👥 Referral & Earn",
+                        "👥 Referral",
                         callback_data="referral"
                     )
                 ],
@@ -1168,7 +1190,7 @@ async def withdraw(
                         "🔙 Back",
                         callback_data="home"
                     )
-                ]
+                ],
             ]),
             parse_mode="HTML"
         )
@@ -1179,8 +1201,8 @@ async def withdraw(
 
         await query.edit_message_text(
             "👛 <b>Wallet Required</b>\n\n"
-            "Withdrawal ከማድረግዎ በፊት "
-            "CBE ወይም Telebirr wallet ያስቀምጡ።",
+            "Before making a withdrawal, "
+            "please save your CBE or Telebirr wallet.",
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
@@ -1193,7 +1215,7 @@ async def withdraw(
                         "🔙 Back",
                         callback_data="home"
                     )
-                ]
+                ],
             ]),
             parse_mode="HTML"
         )
@@ -1205,9 +1227,17 @@ async def withdraw(
     await query.edit_message_text(
         "💳 <b>Withdrawal</b>\n\n"
         f"💰 Available: <b>{balance:.2f} ETB</b>\n"
-        f"🎯 Minimum: <b>{MIN_WITHDRAW:.2f} ETB</b>\n\n"
+        f"📌 Minimum: <b>{MIN_WITHDRAW:.2f} ETB</b>\n\n"
         "የሚያወጡትን amount በETB ያስገቡ።\n\n"
-        "❌ Cancel: /cancel",
+        "ካልፈለጉ ከታች <b>Cancel</b> ይጫኑ።",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="cancel_withdraw"
+                )
+            ]
+        ]),
         parse_mode="HTML"
     )
 
@@ -1226,14 +1256,14 @@ async def support(
 
     text = (
         "🆘 <b>Global Cash Support</b>\n\n"
-        "ለሚፈልጉት አገልግሎት ከታች ይምረጡ 👇"
+        "ለሚፈልጉት service ከታች ይምረጡ 👇"
     )
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "📢 Advertising & Promotion",
-                callback_data="support_ads"
+                callback_data="support_ad"
             )
         ],
         [
@@ -1265,7 +1295,7 @@ async def support(
                 "🔙 Back",
                 callback_data="home"
             )
-        ]
+        ],
     ])
 
     await query.edit_message_text(
@@ -1284,60 +1314,60 @@ async def support_category(
     query = update.callback_query
     await query.answer()
 
-    descriptions = {
-        "ads": (
+    messages = {
+        "support_ad": (
             "📢 <b>Advertising & Promotion</b>\n\n"
-            "Channel • Group • Bot • Business Promotion\n\n"
-            "ማስታወቂያ ለመስራት ያነጋግሩን።"
+            "Channel, group ወይም service ማስታወቂያ "
+            "ለማድረግ ያነጋግሩን።"
         ),
-        "growth": (
+
+        "support_growth": (
             "📈 <b>Telegram Growth</b>\n\n"
-            "Members • Channel Growth • Promotion\n\n"
-            "የTelegram እድገት እና Promotion አገልግሎት።"
+            "Telegram channel / group growth "
+            "እና promotion አገልግሎት ለመጠየቅ ያነጋግሩን።"
         ),
-        "business": (
+
+        "support_business": (
             "💼 <b>Business Promotion</b>\n\n"
-            "Product • Service • Brand Promotion\n\n"
-            "የንግድዎን እና Service ማስተዋወቅ።"
+            "Business, product ወይም service "
+            "ለማስተዋወቅ ያነጋግሩን።"
         ),
-        "app": (
+
+        "support_app": (
             "📱 <b>App / Website Promotion</b>\n\n"
-            "App • Website • Online Service\n\n"
-            "Online project ማስተዋወቅ ከፈለጉ ያነጋግሩን።"
+            "App, website ወይም digital service "
+            "ለማስተዋወቅ ያነጋግሩን።"
         ),
-        "general": (
+
+        "support_general": (
             "💬 <b>General Support</b>\n\n"
-            "ለBot ችግር፣ ጥያቄ ወይም ሌላ እገዛ ካስፈለገዎት ያነጋግሩን።"
+            "Bot ላይ ችግር ካለ ወይም ጥያቄ ካለዎት "
+            "ያነጋግሩን።"
         ),
     }
 
     text = (
-        descriptions.get(
+        messages.get(
             category,
-            "💬 <b>Support</b>"
+            "🆘 <b>Support</b>"
         )
-        + f"\n\n📩 <b>@{SUPPORT_USERNAME}</b>"
+        + "\n\n"
+        f"👤 Contact: @{SUPPORT_USERNAME}"
     )
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "💬 Contact @AmanM_12",
+                "💬 Contact Support",
                 url=f"https://t.me/{SUPPORT_USERNAME}"
             )
         ],
         [
             InlineKeyboardButton(
-                "🔙 Support Menu",
+                "🔙 Back",
                 callback_data="support"
             )
         ],
-        [
-            InlineKeyboardButton(
-                "🏠 Main Menu",
-                callback_data="home"
-            )
-        ]
     ])
 
     await query.edit_message_text(
@@ -1348,17 +1378,20 @@ async def support_category(
 
 
 # =========================================================
-# /CANCEL
+# CANCEL
 # =========================================================
 
-async def cancel(
+async def cancel_action(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
 
+    query = update.callback_query
+    await query.answer()
+
     context.user_data.clear()
 
-    await update.message.reply_text(
+    await query.edit_message_text(
         "❌ <b>Cancelled</b>\n\n"
         "👇 Main Menu",
         reply_markup=main_keyboard(),
@@ -1367,7 +1400,7 @@ async def cancel(
 
 
 # =========================================================
-# TEXT MESSAGE HANDLER
+# TEXT HANDLER
 # =========================================================
 
 async def text_handler(
@@ -1379,10 +1412,12 @@ async def text_handler(
     text = update.message.text.strip()
 
     # -----------------------------------------------------
-    # WALLET SETUP
+    # Wallet setup
     # -----------------------------------------------------
 
-    wallet_setup = context.user_data.get("wallet_setup")
+    wallet_setup = context.user_data.get(
+        "wallet_setup"
+    )
 
     if wallet_setup:
 
@@ -1395,9 +1430,9 @@ async def text_handler(
             ):
 
                 await update.message.reply_text(
-                    "❌ <b>Invalid CBE account number.</b>\n\n"
-                    "13 digits መሆን እና 1000 በሚል "
-                    "መጀመር አለበት።",
+                    "❌ <b>Invalid CBE Account</b>\n\n"
+                    "13 digits መሆን አለበት።\n"
+                    "1000 በሚል መጀመር አለበት።",
                     parse_mode="HTML"
                 )
 
@@ -1415,32 +1450,13 @@ async def text_handler(
             ):
 
                 await update.message.reply_text(
-                    "❌ <b>Invalid Telebirr number.</b>\n\n"
-                    "10 digits እና 09 ወይም 07 በሚል "
-                    "መጀመር አለበት።",
+                    "❌ <b>Invalid Telebirr Number</b>\n\n"
+                    "10 digits መሆን አለበት።\n"
+                    "09 ወይም 07 በሚል መጀመር አለበት።",
                     parse_mode="HTML"
                 )
 
                 return
-
-        # Anti-duplicate-wallet check.
-        if wallet_exists(
-            wallet_setup,
-            text,
-            except_user_id=user.id
-        ):
-
-            mark_suspicious(user.id)
-
-            await update.message.reply_text(
-                "⚠️ <b>Wallet Already Registered</b>\n\n"
-                "ይህ wallet ቀድሞ በሌላ account ተመዝግቧል።\n\n"
-                "አንድ CBE/Telebirr wallet በአንድ verified "
-                "account ብቻ መጠቀም ይቻላል።",
-                parse_mode="HTML"
-            )
-
-            return
 
         saved = set_wallet(
             user.id,
@@ -1450,53 +1466,43 @@ async def text_handler(
 
         if not saved:
 
+            context.user_data.clear()
+
             await update.message.reply_text(
-                "⚠️ Wallet ማስቀመጥ አልተቻለም።\n"
-                "እባክዎ ሌላ valid wallet ይጠቀሙ።"
+                "🛡️ <b>Security Review</b>\n\n"
+                "ይህ wallet ከሌላ account ጋር "
+                "ተመዝግቦ ተገኝቷል።\n\n"
+                "For security reasons, your account "
+                "has been placed under review.",
+                reply_markup=main_keyboard(),
+                parse_mode="HTML"
             )
 
             return
 
+        saved_type = wallet_setup
+
         context.user_data.clear()
 
         await update.message.reply_text(
-            f"✅ <b>{wallet_setup} Wallet Saved!</b>\n\n"
-            "🔐 Wallet security check completed.\n"
+            f"✅ <b>{saved_type} Wallet Saved</b>\n\n"
+            "Your wallet has been saved successfully.\n\n"
             "👇 Main Menu",
             reply_markup=main_keyboard(),
             parse_mode="HTML"
         )
 
-        # If this user had a pending referral,
-        # the reward may now be released.
-        inviter = process_referral_reward(user.id)
-
-        if inviter:
-
-            try:
-                await context.bot.send_message(
-                    chat_id=inviter,
-                    text=(
-                        "🎉 <b>Referral Reward Unlocked!</b>\n\n"
-                        "የጋበዙት user verification እና wallet "
-                        "setup አጠናቋል።\n\n"
-                        f"💰 <b>+{REFERRAL_REWARD:.2f} ETB</b>"
-                    ),
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-
         return
 
     # -----------------------------------------------------
-    # WITHDRAW AMOUNT
+    # Withdrawal amount
     # -----------------------------------------------------
 
     if context.user_data.get("withdraw_amount"):
 
         try:
             amount = float(text)
+
         except ValueError:
 
             await update.message.reply_text(
@@ -1505,7 +1511,9 @@ async def text_handler(
 
             return
 
-        balance = get_balance(user.id)
+        balance = get_balance(
+            user.id
+        )
 
         if amount < MIN_WITHDRAW:
 
@@ -1527,32 +1535,32 @@ async def text_handler(
 
             return
 
-        wallet = get_wallet(user.id)
+        if is_suspicious(user.id):
+
+            context.user_data.clear()
+
+            await update.message.reply_text(
+                "🛡️ <b>Security Review</b>\n\n"
+                "Withdrawal is temporarily unavailable "
+                "while your account is under review.",
+                reply_markup=main_keyboard(),
+                parse_mode="HTML"
+            )
+
+            return
+
+        wallet = get_wallet(
+            user.id
+        )
 
         if not wallet or not wallet[0] or not wallet[1]:
 
             context.user_data.clear()
 
             await update.message.reply_text(
-                "❌ Wallet not found.\n"
+                "❌ Wallet not found.\n\n"
                 "Please set your wallet first.",
                 reply_markup=main_keyboard()
-            )
-
-            return
-
-        # Suspicious accounts should not automatically withdraw.
-        if is_suspicious(user.id):
-
-            context.user_data.clear()
-
-            await update.message.reply_text(
-                "⚠️ <b>Security Review</b>\n\n"
-                "Your account is currently under security review.\n\n"
-                "📩 Please contact Support: "
-                f"@{SUPPORT_USERNAME}",
-                reply_markup=main_keyboard(),
-                parse_mode="HTML"
             )
 
             return
@@ -1569,23 +1577,197 @@ async def text_handler(
         await update.message.reply_text(
             "✅ <b>Withdrawal Request Submitted</b>\n\n"
             f"💰 Amount: <b>{amount:.2f} ETB</b>\n"
-            f"💳 Method: <b>{wallet[0]}</b>\n"
+            f"🏦 Method: <b>{wallet[0]}</b>\n"
             f"🔢 Wallet: <code>{wallet[1]}</code>\n\n"
             "⏳ Status: <b>Pending</b>\n"
-            "📩 Your request has been sent for review.",
+            "Your request has been sent for review.",
             reply_markup=main_keyboard(),
             parse_mode="HTML"
         )
 
-        # Notify admin.
+        # -------------------------------------------------
+        # Notify admin
+        # -------------------------------------------------
+
         admin_id = os.getenv("ADMIN_ID")
 
         if admin_id:
 
             try:
+
                 await context.bot.send_message(
                     chat_id=int(admin_id),
                     text=(
                         "💳 <b>New Withdrawal</b>\n\n"
                         f"👤 User ID: <code>{user.id}</code>\n"
-                        f"💰 Amount: <b>{amount
+                        f"💰 Amount: <b>{amount:.2f} ETB</b>\n"
+                        f"🏦 Method: <b>{wallet[0]}</b>\n"
+                        f"🔢 Wallet: <code>{wallet[1]}</code>\n\n"
+                        "⏳ Status: <b>Pending</b>"
+                    ),
+                    parse_mode="HTML"
+                )
+
+            except Exception as e:
+
+                logger.warning(
+                    "Admin notification failed: %s",
+                    e
+                )
+
+        return
+
+    # -----------------------------------------------------
+    # Normal text
+    # -----------------------------------------------------
+
+    await update.message.reply_text(
+        "👇 <b>Please choose an option from the menu.</b>",
+        reply_markup=main_keyboard(),
+        parse_mode="HTML"
+    )
+
+
+# =========================================================
+# CALLBACKS
+# =========================================================
+
+async def callbacks(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    query = update.callback_query
+    data = query.data
+
+    if data == "verify":
+        await verify(update, context)
+
+    elif data == "home":
+        await query.answer()
+        context.user_data.clear()
+        await send_main_menu(update, context)
+
+    elif data == "balance":
+        await show_balance(update, context)
+
+    elif data == "referral":
+        await show_referral(update, context)
+
+    elif data == "tasks":
+        await show_tasks(update, context)
+
+    elif data == "withdraw":
+        await withdraw(update, context)
+
+    elif data == "wallet":
+        context.user_data.clear()
+        await show_wallet(update, context)
+
+    elif data == "wallet_cbe":
+        await wallet_cbe(update, context)
+
+    elif data == "wallet_telebirr":
+        await wallet_telebirr(update, context)
+
+    elif data == "support":
+        context.user_data.clear()
+        await support(update, context)
+
+    elif data in [
+        "support_ad",
+        "support_growth",
+        "support_business",
+        "support_app",
+        "support_general",
+    ]:
+        await support_category(
+            update,
+            context,
+            data
+        )
+
+    elif data == "cancel_withdraw":
+
+        context.user_data.clear()
+
+        await query.answer()
+
+        await query.edit_message_text(
+            "❌ <b>Withdrawal Cancelled</b>\n\n"
+            "👇 Main Menu",
+            reply_markup=main_keyboard(),
+            parse_mode="HTML"
+        )
+
+    else:
+        await query.answer()
+
+
+# =========================================================
+# ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    logger.error(
+        "Exception while handling update:",
+        exc_info=context.error
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+
+    init_db()
+
+    token = os.getenv("BOT_TOKEN")
+
+    if not token:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    application = (
+        Application.builder()
+        .token(token)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(callbacks)
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler
+        )
+    )
+
+    application.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "%s is starting...",
+        BOT_NAME
+    )
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
