@@ -1,9 +1,9 @@
 import os
 import re
-import html
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
+from html import escape
 
 from telegram import (
     Update,
@@ -20,10 +20,12 @@ from telegram.ext import (
     filters,
 )
 
+# ============================================================
+# GLOBAL CASH BOT
+# ============================================================
 
-# =========================================================
-# CONFIG
-# =========================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 BOT_USERNAME = "GloballCashh_Bot"
 SUPPORT_USERNAME = "@AmanM_12"
@@ -38,58 +40,32 @@ REQUIRED_CHANNELS = [
 ]
 
 MIN_WITHDRAWAL = 30.0
-
-DB_FILE = os.getenv("DB_FILE", "global_cash.db")
+DB_FILE = "global_cash.db"
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("global_cash_bot")
 
 
-# =========================================================
-# ENVIRONMENT
-# =========================================================
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN is missing. Add BOT_TOKEN in Railway Variables."
-    )
-
-if not ADMIN_ID_RAW:
-    raise RuntimeError(
-        "ADMIN_ID is missing. Add ADMIN_ID in Railway Variables."
-    )
-
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
-except ValueError:
-    raise RuntimeError(
-        "ADMIN_ID must be a numeric Telegram User ID."
-    )
-
-
-# =========================================================
+# ============================================================
 # DATABASE
-# =========================================================
+# ============================================================
 
-def db_connect():
+def db():
     conn = sqlite3.connect(DB_FILE, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def now():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db():
-    conn = db_connect()
+    conn = db()
     cur = conn.cursor()
 
     cur.execute("""
@@ -128,8 +104,7 @@ def init_db():
             wallet_type TEXT NOT NULL,
             wallet_number TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            processed_at TEXT
+            created_at TEXT NOT NULL
         )
     """)
 
@@ -145,9 +120,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             description TEXT NOT NULL,
-            channel_username TEXT,
-            channel_url TEXT,
-            reward REAL NOT NULL DEFAULT 0,
+            channel_username TEXT NOT NULL,
+            channel_url TEXT NOT NULL,
+            reward REAL NOT NULL,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         )
@@ -165,29 +140,13 @@ def init_db():
     """)
 
     cur.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS unique_wallet
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_wallet
         ON users(wallet_type, wallet_number)
         WHERE wallet_type IS NOT NULL
-        AND wallet_number IS NOT NULL
-        AND wallet_number != ''
+          AND wallet_number IS NOT NULL
+          AND wallet_number != ''
     """)
 
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_referrer
-        ON referrals(referrer_id)
-    """)
-
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_withdraw_status
-        ON withdrawals(status)
-    """)
-
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_user_tasks
-        ON user_tasks(user_id)
-    """)
-
-    # Default referral reward
     cur.execute("""
         INSERT OR IGNORE INTO settings(key, value)
         VALUES('referral_reward', '2.00')
@@ -197,125 +156,82 @@ def init_db():
     conn.close()
 
 
-# =========================================================
-# SETTINGS
-# =========================================================
-
-def get_setting(key, default=None):
-    conn = db_connect()
+def get_user(user_id):
+    conn = db()
     row = conn.execute(
-        "SELECT value FROM settings WHERE key = ?",
-        (key,),
+        "SELECT * FROM users WHERE user_id=?",
+        (user_id,),
     ).fetchone()
     conn.close()
-
-    if row:
-        return row["value"]
-
-    return default
+    return row
 
 
-def set_setting(key, value):
-    conn = db_connect()
+def create_or_update_user(tg_user, referred_by=None):
+    existing = get_user(tg_user.id)
 
-    conn.execute("""
-        INSERT INTO settings(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key)
-        DO UPDATE SET value = excluded.value
-    """, (key, str(value)))
+    conn = db()
 
-    conn.commit()
-    conn.close()
+    if existing is None:
+        ref = None
 
-
-def get_referral_reward():
-    value = get_setting("referral_reward", "2.00")
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 2.0
-
-
-# =========================================================
-# USERS
-# =========================================================
-
-def create_or_update_user(user, referred_by=None):
-    conn = db_connect()
-
-    row = conn.execute(
-        "SELECT * FROM users WHERE user_id = ?",
-        (user.id,),
-    ).fetchone()
-
-    username = user.username or ""
-    first_name = user.first_name or ""
-
-    if row is None:
-        referrer = None
-
-        if referred_by:
-            try:
-                referred_by = int(referred_by)
-
-                if referred_by != user.id:
-                    referrer = referred_by
-            except ValueError:
-                referrer = None
+        if referred_by and referred_by != tg_user.id:
+            ref = referred_by
 
         conn.execute("""
             INSERT INTO users(
                 user_id,
                 username,
                 first_name,
-                balance,
                 referred_by,
-                referral_paid,
-                referral_status,
-                joined_all,
-                suspicious,
-                wallet_type,
-                wallet_number,
                 created_at
             )
-            VALUES(?, ?, ?, 0, ?, 0, ?, 0, 0, NULL, NULL, ?)
+            VALUES(?,?,?,?,?)
         """, (
-            user.id,
-            username,
-            first_name,
-            referrer,
-            "pending" if referrer else "none",
+            tg_user.id,
+            tg_user.username,
+            tg_user.first_name or "",
+            ref,
             now(),
         ))
 
     else:
         conn.execute("""
             UPDATE users
-            SET username = ?,
-                first_name = ?
-            WHERE user_id = ?
+            SET username=?,
+                first_name=?
+            WHERE user_id=?
         """, (
-            username,
-            first_name,
-            user.id,
+            tg_user.username,
+            tg_user.first_name or "",
+            tg_user.id,
         ))
 
     conn.commit()
     conn.close()
 
 
-def get_user(user_id):
-    conn = db_connect()
+def set_joined_all(user_id, value):
+    conn = db()
 
-    row = conn.execute(
-        "SELECT * FROM users WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
+    conn.execute(
+        "UPDATE users SET joined_all=? WHERE user_id=?",
+        (1 if value else 0, user_id),
+    )
 
+    conn.commit()
     conn.close()
-    return row
+
+
+def add_balance(user_id, amount):
+    conn = db()
+
+    conn.execute(
+        "UPDATE users SET balance=balance+? WHERE user_id=?",
+        (amount, user_id),
+    )
+
+    conn.commit()
+    conn.close()
 
 
 def get_balance(user_id):
@@ -327,66 +243,17 @@ def get_balance(user_id):
     return float(row["balance"])
 
 
-def add_balance(user_id, amount):
-    conn = db_connect()
+def mark_suspicious(user_id, value=1):
+    conn = db()
 
-    conn.execute("""
-        UPDATE users
-        SET balance = balance + ?
-        WHERE user_id = ?
-    """, (
-        amount,
-        user_id,
-    ))
+    conn.execute(
+        "UPDATE users SET suspicious=? WHERE user_id=?",
+        (1 if value else 0, user_id),
+    )
 
     conn.commit()
     conn.close()
 
-
-def set_joined_all(user_id, value):
-    conn = db_connect()
-
-    conn.execute("""
-        UPDATE users
-        SET joined_all = ?
-        WHERE user_id = ?
-    """, (
-        1 if value else 0,
-        user_id,
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def mark_suspicious(user_id, value=True):
-    conn = db_connect()
-
-    conn.execute("""
-        UPDATE users
-        SET suspicious = ?
-        WHERE user_id = ?
-    """, (
-        1 if value else 0,
-        user_id,
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def is_suspicious(user_id):
-    row = get_user(user_id)
-
-    if not row:
-        return False
-
-    return bool(row["suspicious"])
-
-
-# =========================================================
-# WALLET
-# =========================================================
 
 def get_wallet(user_id):
     row = get_user(user_id)
@@ -397,21 +264,22 @@ def get_wallet(user_id):
     if not row["wallet_type"] or not row["wallet_number"]:
         return None
 
-    return (
-        row["wallet_type"],
-        row["wallet_number"],
-    )
+    return row["wallet_type"], row["wallet_number"]
 
 
-def wallet_exists_for_other_user(user_id, wallet_type, wallet_number):
-    conn = db_connect()
+def wallet_exists_for_other_user(
+    wallet_type,
+    wallet_number,
+    user_id,
+):
+    conn = db()
 
     row = conn.execute("""
         SELECT user_id
         FROM users
-        WHERE wallet_type = ?
-        AND wallet_number = ?
-        AND user_id != ?
+        WHERE wallet_type=?
+          AND wallet_number=?
+          AND user_id != ?
     """, (
         wallet_type,
         wallet_number,
@@ -423,15 +291,19 @@ def wallet_exists_for_other_user(user_id, wallet_type, wallet_number):
     return row is not None
 
 
-def save_wallet(user_id, wallet_type, wallet_number):
-    conn = db_connect()
+def set_wallet(
+    user_id,
+    wallet_type,
+    wallet_number,
+):
+    conn = db()
 
     try:
         conn.execute("""
             UPDATE users
-            SET wallet_type = ?,
-                wallet_number = ?
-            WHERE user_id = ?
+            SET wallet_type=?,
+                wallet_number=?
+            WHERE user_id=?
         """, (
             wallet_type,
             wallet_number,
@@ -449,124 +321,118 @@ def save_wallet(user_id, wallet_type, wallet_number):
         conn.close()
 
 
-# =========================================================
-# REFERRALS
-# =========================================================
+def get_setting(key, default=None):
+    conn = db()
 
-def get_successful_referral_count(user_id):
-    conn = db_connect()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (key,),
+    ).fetchone()
+
+    conn.close()
+
+    if row:
+        return row["value"]
+
+    return default
+
+
+def set_setting(key, value):
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO settings(key,value)
+        VALUES(?,?)
+        ON CONFLICT(key)
+        DO UPDATE SET value=excluded.value
+    """, (
+        key,
+        str(value),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def get_referral_reward():
+    try:
+        return float(
+            get_setting(
+                "referral_reward",
+                "2.00",
+            )
+        )
+
+    except Exception:
+        return 2.0
+
+
+def get_referral_count(user_id):
+    conn = db()
 
     row = conn.execute("""
-        SELECT COUNT(*) AS count
+        SELECT COUNT(*) AS c
         FROM referrals
-        WHERE referrer_id = ?
-        AND status = 'paid'
-    """, (user_id,)).fetchone()
+        WHERE referrer_id=?
+          AND status='paid'
+    """, (
+        user_id,
+    )).fetchone()
 
     conn.close()
 
-    return int(row["count"])
+    return int(row["c"])
 
 
-def get_referrals(user_id):
-    conn = db_connect()
+def process_referral_reward(referred_id):
+    user = get_user(referred_id)
 
-    rows = conn.execute("""
-        SELECT
-            r.referred_id,
-            r.reward_amount,
-            r.created_at,
-            u.username,
-            u.first_name
-        FROM referrals r
-        LEFT JOIN users u
-            ON u.user_id = r.referred_id
-        WHERE r.referrer_id = ?
-        AND r.status = 'paid'
-        ORDER BY r.id DESC
-    """, (user_id,)).fetchall()
+    if not user:
+        return None
 
-    conn.close()
+    inviter = user["referred_by"]
 
-    return rows
+    if not inviter:
+        return None
 
+    if inviter == referred_id:
+        return None
 
-def process_referral_reward(user_id):
-    conn = db_connect()
+    if user["referral_paid"]:
+        return None
+
+    if user["suspicious"]:
+        return None
+
+    inviter_row = get_user(inviter)
+
+    if not inviter_row:
+        return None
+
+    if inviter_row["suspicious"]:
+        return None
+
+    conn = db()
 
     try:
-        user = conn.execute(
-            "SELECT * FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-
-        if not user:
-            conn.commit()
-            return None
-
-        referrer_id = user["referred_by"]
-
-        if not referrer_id:
-            conn.commit()
-            return None
-
-        if user["referral_paid"]:
-            conn.commit()
-            return None
-
-        if user["suspicious"]:
-            conn.execute("""
-                UPDATE users
-                SET referral_status = 'blocked'
-                WHERE user_id = ?
-            """, (user_id,))
-
-            conn.commit()
-            return None
-
-        if int(referrer_id) == int(user_id):
-            conn.execute("""
-                UPDATE users
-                SET referral_status = 'blocked',
-                    referral_paid = 0
-                WHERE user_id = ?
-            """, (user_id,))
-
-            conn.commit()
-            return None
-
-        referrer = conn.execute(
-            "SELECT * FROM users WHERE user_id = ?",
-            (referrer_id,),
-        ).fetchone()
-
-        if not referrer:
-            conn.commit()
-            return None
-
-        if referrer["suspicious"]:
-            conn.execute("""
-                UPDATE users
-                SET referral_status = 'blocked'
-                WHERE user_id = ?
-            """, (user_id,))
-
-            conn.commit()
-            return None
-
-        existing = conn.execute("""
+        existing = conn.execute(
+            """
             SELECT id
             FROM referrals
-            WHERE referred_id = ?
-        """, (user_id,)).fetchone()
+            WHERE referred_id=?
+            """,
+            (referred_id,),
+        ).fetchone()
 
         if existing:
             conn.execute("""
                 UPDATE users
-                SET referral_paid = 1,
-                    referral_status = 'paid'
-                WHERE user_id = ?
-            """, (user_id,))
+                SET referral_paid=1,
+                    referral_status='paid'
+                WHERE user_id=?
+            """, (
+                referred_id,
+            ))
 
             conn.commit()
             return None
@@ -575,11 +441,11 @@ def process_referral_reward(user_id):
 
         conn.execute("""
             UPDATE users
-            SET balance = balance + ?
-            WHERE user_id = ?
+            SET balance=balance+?
+            WHERE user_id=?
         """, (
             reward,
-            referrer_id,
+            inviter,
         ))
 
         conn.execute("""
@@ -590,77 +456,209 @@ def process_referral_reward(user_id):
                 status,
                 created_at
             )
-            VALUES(?, ?, ?, 'paid', ?)
+            VALUES(?,?,?,?,?)
         """, (
-            referrer_id,
-            user_id,
+            inviter,
+            referred_id,
             reward,
+            "paid",
             now(),
         ))
 
         conn.execute("""
             UPDATE users
-            SET referral_paid = 1,
-                referral_status = 'paid'
-            WHERE user_id = ?
-        """, (user_id,))
+            SET referral_paid=1,
+                referral_status='paid'
+            WHERE user_id=?
+        """, (
+            referred_id,
+        ))
 
         conn.commit()
 
         return {
-            "referrer_id": referrer_id,
-            "reward": reward,
+            "inviter_id": inviter,
+            "referred_id": referred_id,
+            "amount": reward,
         }
 
     except Exception:
         conn.rollback()
-        logger.exception("Referral processing error")
+
+        logger.exception(
+            "Referral reward error"
+        )
+
         return None
 
     finally:
         conn.close()
 
 
-# =========================================================
-# CHANNEL VERIFICATION
-# =========================================================
+# ============================================================
+# TASKS
+# ============================================================
 
-async def check_channel_membership(bot, user_id):
+def get_active_tasks():
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT *
+        FROM tasks
+        WHERE active=1
+        ORDER BY id DESC
+    """).fetchall()
+
+    conn.close()
+
+    return rows
+
+
+def get_task(task_id):
+    conn = db()
+
+    row = conn.execute(
+        "SELECT * FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+
+    conn.close()
+
+    return row
+
+
+def user_task_paid(user_id, task_id):
+    conn = db()
+
+    row = conn.execute("""
+        SELECT paid
+        FROM user_tasks
+        WHERE user_id=?
+          AND task_id=?
+    """, (
+        user_id,
+        task_id,
+    )).fetchone()
+
+    conn.close()
+
+    return bool(
+        row and row["paid"]
+    )
+
+
+def save_user_task(
+    user_id,
+    task_id,
+    verified,
+    paid,
+):
+    conn = db()
+
+    conn.execute("""
+        INSERT INTO user_tasks(
+            user_id,
+            task_id,
+            verified,
+            paid,
+            paid_at
+        )
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(user_id,task_id)
+        DO UPDATE SET
+            verified=excluded.verified,
+            paid=excluded.paid,
+            paid_at=excluded.paid_at
+    """, (
+        user_id,
+        task_id,
+        1 if verified else 0,
+        1 if paid else 0,
+        now() if paid else None,
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def create_task(
+    title,
+    description,
+    username,
+    url,
+    reward,
+):
+    conn = db()
+
+    cur = conn.execute("""
+        INSERT INTO tasks(
+            title,
+            description,
+            channel_username,
+            channel_url,
+            reward,
+            active,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?)
+    """, (
+        title,
+        description,
+        username,
+        url,
+        reward,
+        1,
+        now(),
+    ))
+
+    task_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    return task_id
+
+
+# ============================================================
+# CHANNEL VERIFICATION
+# ============================================================
+
+async def missing_channels(
+    bot,
+    user_id,
+):
     missing = []
 
     for username, url in REQUIRED_CHANNELS:
+
         try:
             member = await bot.get_chat_member(
                 chat_id=username,
                 user_id=user_id,
             )
 
-            status = member.status
-
-            if status not in (
+            if member.status not in (
                 ChatMemberStatus.MEMBER,
                 ChatMemberStatus.ADMINISTRATOR,
                 ChatMemberStatus.OWNER,
             ):
-                missing.append((username, url))
+                missing.append(
+                    (username, url)
+                )
 
-        except Exception as e:
-            logger.warning(
-                "Channel check failed for %s: %s",
-                username,
-                e,
+        except Exception:
+            missing.append(
+                (username, url)
             )
-
-            missing.append((username, url))
 
     return missing
 
 
-# =========================================================
+# ============================================================
 # KEYBOARDS
-# =========================================================
+# ============================================================
 
-def join_keyboard(missing):
+def channel_keyboard(missing):
     buttons = []
 
     for username, url in missing:
@@ -673,7 +671,7 @@ def join_keyboard(missing):
 
     buttons.append([
         InlineKeyboardButton(
-            "✅ Verify / አረጋግጥ",
+            "✅ Verify",
             callback_data="verify",
         )
     ])
@@ -681,19 +679,37 @@ def join_keyboard(missing):
     return InlineKeyboardMarkup(buttons)
 
 
-def main_menu_keyboard():
+def main_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💰 Balance", callback_data="balance"),
-            InlineKeyboardButton("👥 Referral", callback_data="referral"),
+            InlineKeyboardButton(
+                "💰 Balance",
+                callback_data="balance",
+            ),
+            InlineKeyboardButton(
+                "👥 Referral",
+                callback_data="referral",
+            ),
         ],
         [
-            InlineKeyboardButton("🎯 Tasks", callback_data="tasks"),
-            InlineKeyboardButton("💸 Withdraw", callback_data="withdraw"),
+            InlineKeyboardButton(
+                "🎯 Tasks",
+                callback_data="tasks",
+            ),
+            InlineKeyboardButton(
+                "💸 Withdraw",
+                callback_data="withdraw",
+            ),
         ],
         [
-            InlineKeyboardButton("👛 Wallet", callback_data="wallet"),
-            InlineKeyboardButton("📞 Support", callback_data="support"),
+            InlineKeyboardButton(
+                "👛 Wallet",
+                callback_data="wallet",
+            ),
+            InlineKeyboardButton(
+                "📞 Support",
+                callback_data="support",
+            ),
         ],
     ])
 
@@ -706,6 +722,44 @@ def back_keyboard():
                 callback_data="home",
             )
         ]
+    ])
+
+
+def balance_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💸 Withdraw",
+                callback_data="withdraw",
+            ),
+            InlineKeyboardButton(
+                "👥 Referral",
+                callback_data="referral",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="home",
+            )
+        ],
+    ])
+
+
+def referral_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📤 Share Link",
+                callback_data="share_ref",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="home",
+            )
+        ],
     ])
 
 
@@ -734,13 +788,7 @@ def withdraw_keyboard():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "💸 Withdraw",
-                callback_data="withdraw",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👛 Wallet",
+                "👛 Set / Change Wallet",
                 callback_data="wallet",
             )
         ],
@@ -759,266 +807,135 @@ def admin_keyboard():
             InlineKeyboardButton(
                 "📊 Statistics",
                 callback_data="admin_stats",
-            )
-        ],
-        [
+            ),
             InlineKeyboardButton(
-                "💰 Referral Reward",
+                "💰 Reward",
                 callback_data="admin_reward",
-            )
+            ),
         ],
         [
             InlineKeyboardButton(
-                "💸 Pending Withdrawals",
-                callback_data="admin_withdrawals",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👥 Successful Referrals",
+                "👥 Referrals",
                 callback_data="admin_referrals",
-            )
+            ),
+            InlineKeyboardButton(
+                "💸 Withdrawals",
+                callback_data="admin_withdrawals",
+            ),
         ],
         [
             InlineKeyboardButton(
-                "⚠️ Suspicious Accounts",
+                "⚠️ Suspicious",
                 callback_data="admin_suspicious",
-            )
-        ],
-        [
+            ),
             InlineKeyboardButton(
-                "🔙 Close",
-                callback_data="home",
-            )
+                "🎯 Add Task",
+                callback_data="admin_add_task",
+            ),
         ],
     ])
+    # ============================================================
+# USER PAGES
+# ============================================================
 
-
-def admin_cancel_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "❌ Cancel",
-                callback_data="admin_cancel",
-            )
-        ]
-    ])
-
-
-# =========================================================
-# TEXT HELPERS
-# =========================================================
-
-def user_display(row):
-    username = row["username"] or ""
-
-    if username:
-        return f"@{html.escape(username)}"
-
-    name = row["first_name"] or "Unknown"
-
-    return (
-        f"{html.escape(name)} "
-        f"(<code>{row['user_id']}</code>)"
-    )
-
-
-def referral_link(user_id):
-    return f"https://t.me/{BOT_USERNAME}?start={user_id}"
-
-
-# =========================================================
-# START
-# =========================================================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-
-    referred_by = None
-
-    if context.args:
-        raw = context.args[0].strip()
-
-        if raw.isdigit():
-            try:
-                ref_id = int(raw)
-
-                if ref_id != user.id:
-                    referred_by = ref_id
-
-            except ValueError:
-                pass
-
-    create_or_update_user(
-        user,
-        referred_by=referred_by,
-    )
-
-    missing = await check_channel_membership(
-        context.bot,
-        user.id,
-    )
-
-    if missing:
-        set_joined_all(user.id, False)
-
-        text = (
-            "💎 <b>Welcome to Global Cash Bot!</b>\n\n"
-            "🇪🇹 ለቦቱን ሙሉ በሙሉ ለመጠቀም "
-            "ከታች ያሉትን channels መጀመሪያ ይቀላቀሉ።\n\n"
-            "👇 <b>Required Channels</b>\n"
-            "ከጨረሱ በኋላ <b>Verify</b> ይጫኑ።"
-        )
-
-        await update.message.reply_text(
-            text,
-            reply_markup=join_keyboard(missing),
-            parse_mode="HTML",
-        )
-
-        return
-
-    set_joined_all(user.id, True)
-
-    result = process_referral_reward(user.id)
-
-    if result:
-        try:
-            await context.bot.send_message(
-                chat_id=result["referrer_id"],
-                text=(
-                    "🎉 <b>New Successful Referral!</b>\n\n"
-                    f"👤 User ID: <code>{user.id}</code>\n"
-                    f"💰 Reward: <b>{result['reward']:.2f} ETB</b>\n\n"
-                    "Your referral reward has been added."
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:
-            logger.exception(
-                "Could not notify referrer."
-            )
-
-    await update.message.reply_text(
-        "🎉 <b>Verification Successful!</b>\n\n"
-        "🇪🇹 እንኳን ወደ <b>Global Cash Bot</b> በደህና መጡ።\n\n"
-        "💎 ከታች ያሉትን options በመጠቀም ይጀምሩ።",
-        reply_markup=main_menu_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# HOME
-# =========================================================
-
-async def show_home(query):
+async def show_home(query, user_id):
     await query.edit_message_text(
-        "💎 <b>Global Cash Bot</b>\n\n"
-        "🇪🇹 እንኳን በደህና መጡ።\n"
-        "ከታች ያለውን menu ይምረጡ።",
-        reply_markup=main_menu_keyboard(),
+        "💰 <b>Global Cash Bot</b>\n\n"
+        "Welcome! 👋\n"
+        "Choose an option below to continue.",
+        reply_markup=main_keyboard(),
         parse_mode="HTML",
     )
 
-
-# =========================================================
-# BALANCE
-# =========================================================
 
 async def show_balance(query, user_id):
     balance = get_balance(user_id)
 
-    await query.edit_message_text(
+    text = (
         "💰 <b>Your Balance</b>\n\n"
         f"💵 Balance: <b>{balance:.2f} ETB</b>\n"
         f"💸 Minimum Withdrawal: <b>{MIN_WITHDRAWAL:.2f} ETB</b>\n\n"
-        "🇪🇹 የሚያገኙትን ገንዘብ ከዚህ ላይ ማየት ይችላሉ።",
-        reply_markup=withdraw_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# REFERRAL
-# =========================================================
-
-async def show_referral(query, user_id):
-    count = get_successful_referral_count(user_id)
-    reward = get_referral_reward()
-    link = referral_link(user_id)
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📤 Share Link",
-                url=(
-                    "https://t.me/share/url?"
-                    f"url={link}"
-                ),
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="home",
-            )
-        ],
-    ])
-
-    text = (
-        "👥 <b>Referral Program</b>\n\n"
-        f"👤 Successful Referrals: <b>{count}</b>\n"
-        f"💰 Current Reward: <b>{reward:.2f} ETB</b>\n\n"
-        "🔗 <b>Your Referral Link:</b>\n"
-        f"<code>{html.escape(link)}</code>\n\n"
-        "📌 ሰው በእርስዎ link መጥቶ "
-        "ሁሉንም required channels ከተቀላቀለና Verify ካደረገ "
-        "ብቻ successful referral ይቆጠራል።"
+        "Keep completing tasks and referrals to increase "
+        "your balance."
     )
 
     await query.edit_message_text(
         text,
-        reply_markup=keyboard,
+        reply_markup=balance_keyboard(),
         parse_mode="HTML",
     )
 
 
-# =========================================================
-# TASKS
-# =========================================================
+async def show_referral(query, user_id):
+    count = get_referral_count(user_id)
+    reward = get_referral_reward()
+
+    link = (
+        f"https://t.me/{BOT_USERNAME}"
+        f"?start={user_id}"
+    )
+
+    text = (
+        "👥 <b>Referral Program</b>\n\n"
+        f"👤 Successful Referrals: <b>{count}</b>\n"
+        f"🎁 Current Reward: <b>{reward:.2f} ETB</b>\n\n"
+        "Invite your friends using your personal link.\n"
+        "When your referred user joins all required "
+        "channels and completes verification, "
+        "the current referral reward will be added "
+        "to your balance.\n\n"
+        "🔗 <b>Your Referral Link:</b>\n"
+        f"<code>{escape(link)}</code>"
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=referral_keyboard(),
+        parse_mode="HTML",
+    )
+
 
 async def show_tasks(query, user_id):
-    conn = db_connect()
+    tasks = get_active_tasks()
 
-    tasks = conn.execute("""
-        SELECT *
-        FROM tasks
-        WHERE active = 1
-        ORDER BY id DESC
-    """).fetchall()
-
-    conn.close()
-
-    if not tasks:
-        await query.edit_message_text(
-            "🎯 <b>Tasks</b>\n\n"
-            "📌 አሁን ላይ የሚገኙ active tasks የሉም።\n\n"
-            "🔥 New earning tasks ሲጨመሩ እዚህ ይታያሉ።",
-            reply_markup=back_keyboard(),
-            parse_mode="HTML",
-        )
-        return
+    lines = [
+        "🎯 <b>Tasks</b>",
+        "",
+        "Complete tasks and earn ETB.",
+        "",
+    ]
 
     buttons = []
 
-    for task in tasks:
-        buttons.append([
-            InlineKeyboardButton(
-                f"🎯 {task['title']}",
-                callback_data=f"task_{task['id']}",
+    # Referral task
+    reward = get_referral_reward()
+
+    lines.append(
+        f"👥 <b>Referral Task</b> — "
+        f"Earn <b>{reward:.2f} ETB</b> per successful referral."
+    )
+
+    lines.append("")
+
+    if tasks:
+        for task in tasks:
+            lines.append(
+                f"🎯 <b>{escape(task['title'])}</b>\n"
+                f"{escape(task['description'])}\n"
+                f"💰 Reward: <b>{task['reward']:.2f} ETB</b>"
             )
-        ])
+
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🎯 {task['title']}",
+                    callback_data=f"task_{task['id']}",
+                )
+            ])
+
+    else:
+        lines.append(
+            "📌 More earning tasks will be added soon."
+        )
 
     buttons.append([
         InlineKeyboardButton(
@@ -1028,60 +945,40 @@ async def show_tasks(query, user_id):
     ])
 
     await query.edit_message_text(
-        "🎯 <b>Available Tasks</b>\n\n"
-        "ከታች ያለውን task ይምረጡ።",
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="HTML",
     )
 
 
 async def show_task(query, user_id, task_id):
-    conn = db_connect()
+    task = get_task(task_id)
 
-    task = conn.execute("""
-        SELECT *
-        FROM tasks
-        WHERE id = ?
-        AND active = 1
-    """, (task_id,)).fetchone()
-
-    done = conn.execute("""
-        SELECT *
-        FROM user_tasks
-        WHERE user_id = ?
-        AND task_id = ?
-    """, (
-        user_id,
-        task_id,
-    )).fetchone()
-
-    conn.close()
-
-    if not task:
+    if not task or not task["active"]:
         await query.answer(
-            "Task not found.",
+            "This task is no longer available.",
             show_alert=True,
         )
         return
 
-    buttons = []
+    paid = user_task_paid(
+        user_id,
+        task_id,
+    )
 
-    if task["channel_url"]:
-        buttons.append([
+    buttons = [
+        [
             InlineKeyboardButton(
-                "📢 Open Task",
+                "📢 Join Channel",
                 url=task["channel_url"],
             )
-        ])
+        ]
+    ]
 
-    if done and done["paid"]:
-        status = "✅ Completed"
-    else:
-        status = "⏳ Not verified"
-
+    if not paid:
         buttons.append([
             InlineKeyboardButton(
-                "✅ Verify Task",
+                "✅ Verify",
                 callback_data=f"verify_task_{task_id}",
             )
         ])
@@ -1093,11 +990,23 @@ async def show_task(query, user_id, task_id):
         )
     ])
 
+    if paid:
+        status = (
+            "✅ <b>Completed</b>\n\n"
+            "This task has already been paid."
+        )
+    else:
+        status = (
+            "⏳ <b>Status:</b> Not completed yet.\n\n"
+            "Join the channel and press Verify."
+        )
+
     text = (
-        f"🎯 <b>{html.escape(task['title'])}</b>\n\n"
-        f"{html.escape(task['description'])}\n\n"
+        f"🎯 <b>{escape(task['title'])}</b>\n\n"
+        f"{escape(task['description'])}\n\n"
         f"💰 Reward: <b>{task['reward']:.2f} ETB</b>\n"
-        f"📌 Status: <b>{status}</b>"
+        f"📢 Channel: <b>{escape(task['channel_username'])}</b>\n\n"
+        f"{status}"
     )
 
     await query.edit_message_text(
@@ -1107,228 +1016,61 @@ async def show_task(query, user_id, task_id):
     )
 
 
-async def verify_task(query, user_id, task_id):
-    conn = db_connect()
-
-    task = conn.execute("""
-        SELECT *
-        FROM tasks
-        WHERE id = ?
-        AND active = 1
-    """, (task_id,)).fetchone()
-
-    if not task:
-        conn.close()
-
-        await query.answer(
-            "Task not found.",
-            show_alert=True,
-        )
-        return
-
-    existing = conn.execute("""
-        SELECT *
-        FROM user_tasks
-        WHERE user_id = ?
-        AND task_id = ?
-    """, (
-        user_id,
-        task_id,
-    )).fetchone()
-
-    if existing and existing["paid"]:
-        conn.close()
-
-        await query.answer(
-            "Already completed.",
-            show_alert=True,
-        )
-        return
-
-    conn.close()
-
-    if not task["channel_username"]:
-        await query.answer(
-            "No verification channel configured.",
-            show_alert=True,
-        )
-        return
-
-    try:
-        member = await query.get_bot().get_chat_member(
-            chat_id=task["channel_username"],
-            user_id=user_id,
-        )
-
-        if member.status not in (
-            ChatMemberStatus.MEMBER,
-            ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.OWNER,
-        ):
-            await query.answer(
-                "Please join the task channel first.",
-                show_alert=True,
-            )
-            return
-
-    except Exception:
-        await query.answer(
-            "Verification failed. Try again.",
-            show_alert=True,
-        )
-        return
-
-    conn = db_connect()
-
-    existing = conn.execute("""
-        SELECT *
-        FROM user_tasks
-        WHERE user_id = ?
-        AND task_id = ?
-    """, (
-        user_id,
-        task_id,
-    )).fetchone()
-
-    if existing and existing["paid"]:
-        conn.close()
-
-        await query.answer(
-            "Already completed.",
-            show_alert=True,
-        )
-        return
-
-    reward = float(task["reward"])
-
-    conn.execute("""
-        INSERT INTO user_tasks(
-            user_id,
-            task_id,
-            verified,
-            paid,
-            paid_at
-        )
-        VALUES(?, ?, 1, 1, ?)
-        ON CONFLICT(user_id, task_id)
-        DO UPDATE SET
-            verified = 1,
-            paid = 1,
-            paid_at = excluded.paid_at
-    """, (
-        user_id,
-        task_id,
-        now(),
-    ))
-
-    conn.execute("""
-        UPDATE users
-        SET balance = balance + ?
-        WHERE user_id = ?
-    """, (
-        reward,
-        user_id,
-    ))
-
-    conn.commit()
-    conn.close()
-
-    await query.answer(
-        f"Success! +{reward:.2f} ETB",
-        show_alert=True,
-    )
-
-    await show_tasks(query, user_id)
-
-
-# =========================================================
-# WALLET
-# =========================================================
-
 async def show_wallet(query, user_id):
     wallet = get_wallet(user_id)
 
     if wallet:
-        wallet_text = (
-            f"🏦 Method: <b>{html.escape(wallet[0])}</b>\n"
-            f"🔢 Number: <code>{html.escape(wallet[1])}</code>\n\n"
-            "ይህን wallet በመቀየር ሌላ wallet ማስቀመጥ ይችላሉ።"
+        wallet_type, wallet_number = wallet
+
+        text = (
+            "👛 <b>Your Wallet</b>\n\n"
+            f"💳 Method: <b>{escape(wallet_type)}</b>\n"
+            f"🔢 Number: <code>{escape(wallet_number)}</code>\n\n"
+            "You can switch between CBE and Telebirr "
+            "anytime."
         )
+
     else:
-        wallet_text = (
-            "⚠️ <b>No Wallet Saved</b>\n\n"
-            "Withdrawal ለማድረግ CBE ወይም Telebirr "
-            "wallet ያስገቡ።"
+        text = (
+            "👛 <b>Wallet</b>\n\n"
+            "No wallet is saved yet.\n\n"
+            "Choose your preferred withdrawal method:"
         )
 
     await query.edit_message_text(
-        "👛 <b>Wallet</b>\n\n" + wallet_text,
+        text,
         reply_markup=wallet_keyboard(),
         parse_mode="HTML",
     )
 
 
-async def ask_wallet_number(query, context, wallet_type):
-    context.user_data["wallet_type"] = wallet_type
+async def show_withdraw(query, user_id, context):
+    user = get_user(user_id)
 
-    if wallet_type == "CBE":
-        text = (
-            "🏦 <b>CBE Wallet</b>\n\n"
-            "13-digit CBE account number ያስገቡ።\n\n"
-            "Example:\n"
-            "<code>1000123456789</code>\n\n"
-            "🔙 ለመመለስ /cancel ይጻፉ።"
-        )
-
-    else:
-        text = (
-            "📱 <b>Telebirr Wallet</b>\n\n"
-            "10-digit Telebirr number ያስገቡ።\n\n"
-            "Number 09 ወይም 07 መጀመር አለበት።\n\n"
-            "Example:\n"
-            "<code>0912345678</code>\n\n"
-            "🔙 ለመመለስ /cancel ይጻፉ።"
-        )
-
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# WITHDRAW
-# =========================================================
-
-async def show_withdraw(query, user_id):
-    row = get_user(user_id)
-
-    if not row:
-        await query.edit_message_text(
-            "User not found.",
-            reply_markup=back_keyboard(),
-        )
+    if not user:
         return
 
-    if row["suspicious"]:
+    if user["suspicious"]:
         await query.edit_message_text(
             "⚠️ <b>Security Review</b>\n\n"
-            "Your account is currently under security review.\n\n"
-            f"📞 Contact: {SUPPORT_USERNAME}",
+            "Your account is currently under security "
+            "review.\n\n"
+            f"📞 Contact Support: {SUPPORT_USERNAME}",
             reply_markup=back_keyboard(),
             parse_mode="HTML",
         )
         return
 
-    balance = float(row["balance"])
+    balance = float(user["balance"])
 
     if balance < MIN_WITHDRAWAL:
         await query.edit_message_text(
             "💸 <b>Withdraw</b>\n\n"
-            f"Your Balance: <b>{balance:.2f} ETB</b>\n"
-            f"Minimum: <b>{MIN_WITHDRAWAL:.2f} ETB</b>\n\n"
-            "⚠️ ቢያንስ 30 ETB ሲደርስ withdrawal ማድረግ ይችላሉ።",
-            reply_markup=withdraw_keyboard(),
+            f"Your balance: <b>{balance:.2f} ETB</b>\n"
+            f"Minimum withdrawal: <b>{MIN_WITHDRAWAL:.2f} ETB</b>\n\n"
+            "You need more balance before requesting "
+            "a withdrawal.",
+            reply_markup=balance_keyboard(),
             parse_mode="HTML",
         )
         return
@@ -1337,121 +1079,45 @@ async def show_withdraw(query, user_id):
 
     if not wallet:
         await query.edit_message_text(
-            "👛 <b>Wallet Required</b>\n\n"
-            "Withdrawal ከማድረግዎ በፊት CBE ወይም Telebirr "
-            "wallet ያስቀምጡ።",
-            reply_markup=wallet_keyboard(),
+            "💸 <b>Withdraw</b>\n\n"
+            "⚠️ You need to set a withdrawal wallet first.\n\n"
+            "Choose CBE or Telebirr and save your wallet.",
+            reply_markup=withdraw_keyboard(),
             parse_mode="HTML",
         )
         return
 
-    context_text = (
-        "💸 <b>Withdraw</b>\n\n"
-        f"💰 Available Balance: <b>{balance:.2f} ETB</b>\n"
-        f"🏦 Method: <b>{html.escape(wallet[0])}</b>\n"
-        f"🔢 Wallet: <code>{html.escape(wallet[1])}</code>\n\n"
-        "የሚወጣውን amount በETB ቁጥር ያስገቡ።\n\n"
-        "Example: <code>30</code>"
-    )
+    wallet_type, wallet_number = wallet
 
-    context.user_data["withdraw_mode"] = True
+    context.user_data["withdraw_step"] = "amount"
 
     await query.edit_message_text(
-        context_text,
+        "💸 <b>Withdraw</b>\n\n"
+        f"💰 Available Balance: <b>{balance:.2f} ETB</b>\n"
+        f"🏦 Method: <b>{escape(wallet_type)}</b>\n"
+        f"🔢 Wallet: <code>{escape(wallet_number)}</code>\n\n"
+        "Please enter the amount you want to withdraw.\n\n"
+        f"Minimum: <b>{MIN_WITHDRAWAL:.2f} ETB</b>\n"
+        f"Maximum: <b>{balance:.2f} ETB</b>\n\n"
+        "Send only the amount, for example:\n"
+        "<code>50</code>",
+        reply_markup=back_keyboard(),
         parse_mode="HTML",
     )
 
 
-async def create_withdrawal(user_id, amount):
-    conn = db_connect()
-
-    try:
-        row = conn.execute("""
-            SELECT balance, wallet_type, wallet_number, suspicious
-            FROM users
-            WHERE user_id = ?
-        """, (user_id,)).fetchone()
-
-        if not row:
-            conn.rollback()
-            return False, "User not found."
-
-        if row["suspicious"]:
-            conn.rollback()
-            return False, "Security review."
-
-        if not row["wallet_type"] or not row["wallet_number"]:
-            conn.rollback()
-            return False, "Wallet required."
-
-        # Deduct only if enough balance exists.
-        cur = conn.execute("""
-            UPDATE users
-            SET balance = balance - ?
-            WHERE user_id = ?
-            AND balance >= ?
-            AND suspicious = 0
-        """, (
-            amount,
-            user_id,
-            amount,
-        ))
-
-        if cur.rowcount != 1:
-            conn.rollback()
-            return False, "Insufficient balance."
-
-        conn.execute("""
-            INSERT INTO withdrawals(
-                user_id,
-                amount,
-                wallet_type,
-                wallet_number,
-                status,
-                created_at
-            )
-            VALUES(?, ?, ?, ?, 'pending', ?)
-        """, (
-            user_id,
-            amount,
-            row["wallet_type"],
-            row["wallet_number"],
-            now(),
-        ))
-
-        withdrawal_id = conn.execute(
-            "SELECT last_insert_rowid()"
-        ).fetchone()[0]
-
-        conn.commit()
-
-        return True, withdrawal_id
-
-    except Exception:
-        conn.rollback()
-        logger.exception("Withdrawal creation error")
-        return False, "Database error."
-
-    finally:
-        conn.close()
-
-
-# =========================================================
-# SUPPORT
-# =========================================================
-
-async def show_support(query):
+async def show_support(query, user_id):
     text = (
-        "📢 <b>Advertising & Telegram Promotion</b>\n\n"
-        "🚀 <b>Channel Promotion</b>\n"
-        "📈 <b>Channel Growth</b>\n"
+        "📞 <b>Support & Promotion</b>\n\n"
+        "We provide Telegram and digital promotion services.\n\n"
+        "📢 <b>Channel Promotion</b>\n"
+        "🚀 <b>Channel Growth</b>\n"
         "👥 <b>Group Advertising</b>\n"
         "🏢 <b>Business Promotion</b>\n"
-        "🌐 <b>App & Website Promotion</b>\n"
+        "📱 <b>App & Website Promotion</b>\n"
         "✨ <b>Custom Promotion</b>\n\n"
-        "🇪🇹 ለማስታወቂያ እና promotion አገልግሎት "
-        "ያግኙን።\n\n"
-        "💰 Price & More Info ለማወቅ Contact Support ይጫኑ።"
+        "For price, availability and more information, "
+        "contact our support team."
     )
 
     keyboard = InlineKeyboardMarkup([
@@ -1476,61 +1142,137 @@ async def show_support(query):
     )
 
 
-# =========================================================
-# ADMIN
-# =========================================================
+# ============================================================
+# CHANNEL JOIN / VERIFY
+# ============================================================
 
-async def admin_command(update, context):
-    if update.effective_user.id != ADMIN_ID:
+async def show_join_required(
+    update,
+    context,
+    missing,
+):
+    text = (
+        "👋 <b>Welcome to Global Cash Bot!</b>\n\n"
+        "Before using the bot, please join all required "
+        "channels below.\n\n"
+        "After joining them, press <b>✅ Verify</b>.\n\n"
+        f"📌 Remaining channels: <b>{len(missing)}</b>"
+    )
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text,
+            reply_markup=channel_keyboard(missing),
+            parse_mode="HTML",
+        )
+    else:
         await update.message.reply_text(
-            "⛔ Access denied."
+            text,
+            reply_markup=channel_keyboard(missing),
+            parse_mode="HTML",
+        )
+
+
+# ============================================================
+# WALLET INPUT
+# ============================================================
+
+async def ask_wallet(
+    query,
+    user_id,
+    wallet_type,
+    context,
+):
+    context.user_data["wallet_type"] = wallet_type
+    context.user_data["wallet_step"] = "number"
+
+    if wallet_type == "CBE":
+        instruction = (
+            "🏦 <b>CBE Wallet</b>\n\n"
+            "Send your CBE account number.\n\n"
+            "Requirements:\n"
+            "• Exactly 13 digits\n"
+            "• Must start with <b>1000</b>\n\n"
+            "Example:\n"
+            "<code>1000123456789</code>"
+        )
+
+    else:
+        instruction = (
+            "📱 <b>Telebirr Wallet</b>\n\n"
+            "Send your Telebirr phone number.\n\n"
+            "Requirements:\n"
+            "• Exactly 10 digits\n"
+            "• Must start with <b>09</b> or <b>07</b>\n\n"
+            "Example:\n"
+            "<code>0912345678</code>"
+        )
+
+    await query.edit_message_text(
+        instruction,
+        reply_markup=back_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# ADMIN FUNCTIONS
+# ============================================================
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
+async def show_admin(query):
+    if not is_admin(query.from_user.id):
+        await query.answer(
+            "⛔ Admin only.",
+            show_alert=True,
         )
         return
 
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "👑 <b>Global Cash Bot Admin Panel</b>\n\n"
-        "Admin-only controls:",
+    await query.edit_message_text(
+        "🛠 <b>Global Cash Bot Admin Panel</b>\n\n"
+        "Choose an option:",
         reply_markup=admin_keyboard(),
         parse_mode="HTML",
     )
 
 
-async def admin_stats(query):
-    conn = db_connect()
+async def show_admin_stats(query):
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
 
     total_users = conn.execute(
         "SELECT COUNT(*) AS c FROM users"
     ).fetchone()["c"]
 
-    verified_users = conn.execute("""
-        SELECT COUNT(*) AS c
-        FROM users
-        WHERE joined_all = 1
-    """).fetchone()["c"]
+    verified_users = conn.execute(
+        "SELECT COUNT(*) AS c FROM users WHERE joined_all=1"
+    ).fetchone()["c"]
 
-    total_balance = conn.execute("""
-        SELECT COALESCE(SUM(balance), 0) AS total
-        FROM users
-    """).fetchone()["total"]
+    total_balance = conn.execute(
+        "SELECT COALESCE(SUM(balance),0) AS s FROM users"
+    ).fetchone()["s"]
 
     successful_referrals = conn.execute("""
         SELECT COUNT(*) AS c
         FROM referrals
-        WHERE status = 'paid'
+        WHERE status='paid'
     """).fetchone()["c"]
 
     pending_withdrawals = conn.execute("""
         SELECT COUNT(*) AS c
         FROM withdrawals
-        WHERE status = 'pending'
+        WHERE status='pending'
     """).fetchone()["c"]
 
-    suspicious = conn.execute("""
+    suspicious_accounts = conn.execute("""
         SELECT COUNT(*) AS c
         FROM users
-        WHERE suspicious = 1
+        WHERE suspicious=1
     """).fetchone()["c"]
 
     conn.close()
@@ -1542,54 +1284,62 @@ async def admin_stats(query):
         f"💰 Total Balance: <b>{float(total_balance):.2f} ETB</b>\n"
         f"👥 Successful Referrals: <b>{successful_referrals}</b>\n"
         f"💸 Pending Withdrawals: <b>{pending_withdrawals}</b>\n"
-        f"⚠️ Suspicious Accounts: <b>{suspicious}</b>\n"
+        f"⚠️ Suspicious Accounts: <b>{suspicious_accounts}</b>"
     )
 
     await query.edit_message_text(
         text,
-        reply_markup=admin_keyboard(),
+        reply_markup=back_keyboard(),
         parse_mode="HTML",
     )
 
 
-# =========================================================
-# ADMIN REFERRAL REWARD
-# =========================================================
+async def show_admin_reward(query):
+    if not is_admin(query.from_user.id):
+        return
 
-async def admin_reward(query, context):
     reward = get_referral_reward()
 
-    context.user_data["admin_state"] = "reward"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✏️ Change Reward",
+                callback_data="admin_change_reward",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Back",
+                callback_data="admin",
+            )
+        ],
+    ])
 
     await query.edit_message_text(
         "💰 <b>Referral Reward Settings</b>\n\n"
         f"Current Reward: <b>{reward:.2f} ETB</b>\n\n"
-        "Enter the new amount.\n\n"
-        "Example:\n"
-        "<code>1.00</code>\n"
-        "<code>2.00</code>\n"
-        "<code>5.00</code>\n\n"
-        "📌 This applies only to new successful referrals.\n"
-        "Previously paid rewards will NOT change.",
-        reply_markup=admin_cancel_keyboard(),
+        "You can change the reward amount.\n"
+        "The new amount will apply only to "
+        "<b>new successful referrals</b>.\n\n"
+        "Previously paid referral rewards will not change.",
+        reply_markup=keyboard,
         parse_mode="HTML",
     )
 
 
-async def admin_referral_list(query):
-    conn = db_connect()
+async def show_admin_referrals(query):
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
 
     rows = conn.execute("""
         SELECT
-            u.user_id,
-            u.username,
-            u.first_name,
-            COUNT(r.id) AS count
-        FROM users u
-        JOIN referrals r
-            ON r.referrer_id = u.user_id
-        WHERE r.status = 'paid'
-        GROUP BY u.user_id
+            referrer_id,
+            COUNT(*) AS count
+        FROM referrals
+        WHERE status='paid'
+        GROUP BY referrer_id
         ORDER BY count DESC
         LIMIT 20
     """).fetchall()
@@ -1597,94 +1347,42 @@ async def admin_referral_list(query):
     conn.close()
 
     if not rows:
-        await query.edit_message_text(
+        text = (
             "👥 <b>Successful Referrals</b>\n\n"
-            "No successful referrals yet.",
-            reply_markup=admin_keyboard(),
-            parse_mode="HTML",
+            "No successful referrals yet."
         )
-        return
+    else:
+        lines = [
+            "👥 <b>Successful Referrals</b>",
+            "",
+            "Top referrers:",
+            "",
+        ]
 
-    buttons = []
-
-    for row in rows:
-        name = row["username"]
-
-        if name:
-            label = f"@{name} — {row['count']}"
-        else:
-            label = f"{row['user_id']} — {row['count']}"
-
-        buttons.append([
-            InlineKeyboardButton(
-                f"👤 {label}",
-                callback_data=f"admin_ref_{row['user_id']}",
+        for row in rows:
+            lines.append(
+                f"👤 <code>{row['referrer_id']}</code> — "
+                f"<b>{row['count']}</b> successful"
             )
+
+        lines.extend([
+            "",
+            "To see the exact users referred by an account, "
+            "use the detailed lookup below."
         ])
 
-    buttons.append([
-        InlineKeyboardButton(
-            "🔙 Back",
-            callback_data="admin",
-        )
-    ])
-
-    await query.edit_message_text(
-        "👥 <b>Successful Referrals</b>\n\n"
-        "Select a referrer to see exactly who they referred:",
-        reply_markup=InlineKeyboardMarkup(buttons),
-        parse_mode="HTML",
-    )
-
-
-async def admin_referral_detail(query, referrer_id):
-    rows = get_referrals(referrer_id)
-    referrer = get_user(referrer_id)
-
-    if not rows:
-        await query.edit_message_text(
-            "No successful referrals found.",
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    text = (
-        "👥 <b>Successful Referrals</b>\n\n"
-        f"Referrer: {user_display(referrer)}\n"
-        f"Total: <b>{len(rows)}</b>\n\n"
-    )
-
-    for index, row in enumerate(rows, start=1):
-        username = row["username"]
-
-        if username:
-            person = f"@{html.escape(username)}"
-        else:
-            person = (
-                f"{html.escape(row['first_name'] or 'Unknown')} "
-                f"(<code>{row['referred_id']}</code>)"
-            )
-
-        text += (
-            f"{index}. {person}\n"
-            f"   💰 Reward: {row['reward_amount']:.2f} ETB\n"
-            f"   📅 {row['created_at']}\n\n"
-        )
-
-        if len(text) > 3800:
-            text += "\n...and more."
-            break
+        text = "\n".join(lines)
 
     keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
-                "🔙 Back",
-                callback_data="admin_referrals",
+                "🔎 Detailed Lookup",
+                callback_data="admin_referral_lookup",
             )
         ],
         [
             InlineKeyboardButton(
-                "👑 Admin",
+                "🔙 Back",
                 callback_data="admin",
             )
         ],
@@ -1697,18 +1395,17 @@ async def admin_referral_detail(query, referrer_id):
     )
 
 
-# =========================================================
-# ADMIN WITHDRAWALS
-# =========================================================
+async def show_admin_withdrawals(query):
+    if not is_admin(query.from_user.id):
+        return
 
-async def admin_withdrawals(query):
-    conn = db_connect()
+    conn = db()
 
     rows = conn.execute("""
         SELECT *
         FROM withdrawals
-        WHERE status = 'pending'
-        ORDER BY id ASC
+        WHERE status='pending'
+        ORDER BY id DESC
         LIMIT 20
     """).fetchall()
 
@@ -1718,19 +1415,36 @@ async def admin_withdrawals(query):
         await query.edit_message_text(
             "💸 <b>Pending Withdrawals</b>\n\n"
             "No pending withdrawals.",
-            reply_markup=admin_keyboard(),
+            reply_markup=back_keyboard(),
             parse_mode="HTML",
         )
         return
 
     buttons = []
 
+    lines = [
+        "💸 <b>Pending Withdrawals</b>",
+        "",
+    ]
+
     for row in rows:
+        lines.append(
+            f"🆔 <b>#{row['id']}</b> | "
+            f"User: <code>{row['user_id']}</code>\n"
+            f"💰 {row['amount']:.2f} ETB | "
+            f"{escape(row['wallet_type'])}\n"
+            f"🔢 <code>{escape(row['wallet_number'])}</code>\n"
+        )
+
         buttons.append([
             InlineKeyboardButton(
-                f"💸 #{row['id']} — {row['amount']:.2f} ETB",
-                callback_data=f"admin_wd_{row['id']}",
-            )
+                f"#{row['id']} Approve",
+                callback_data=f"approve_wd_{row['id']}",
+            ),
+            InlineKeyboardButton(
+                f"#{row['id']} Reject",
+                callback_data=f"reject_wd_{row['id']}",
+            ),
         ])
 
     buttons.append([
@@ -1741,83 +1455,718 @@ async def admin_withdrawals(query):
     ])
 
     await query.edit_message_text(
-        "💸 <b>Pending Withdrawals</b>\n\n"
-        "Select a withdrawal:",
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="HTML",
     )
 
 
-async def admin_withdrawal_detail(query, withdrawal_id):
-    conn = db_connect()
+async def show_admin_suspicious(query):
+    if not is_admin(query.from_user.id):
+        return
 
-    row = conn.execute("""
-        SELECT *
-        FROM withdrawals
-        WHERE id = ?
-    """, (withdrawal_id,)).fetchone()
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT user_id, username, first_name, balance
+        FROM users
+        WHERE suspicious=1
+        ORDER BY user_id DESC
+        LIMIT 50
+    """).fetchall()
 
     conn.close()
 
-    if not row:
+    if not rows:
+        text = (
+            "⚠️ <b>Suspicious Accounts</b>\n\n"
+            "No suspicious accounts."
+        )
+    else:
+        lines = [
+            "⚠️ <b>Suspicious Accounts</b>",
+            "",
+        ]
+
+        for row in rows:
+            name = (
+                f"@{row['username']}"
+                if row["username"]
+                else row["first_name"] or "No username"
+            )
+
+            lines.append(
+                f"👤 {escape(name)}\n"
+                f"🆔 <code>{row['user_id']}</code>\n"
+                f"💰 {row['balance']:.2f} ETB\n"
+            )
+
+        text = "\n".join(lines)
+
+    await query.edit_message_text(
+        text,
+        reply_markup=back_keyboard(),
+        parse_mode="HTML",
+    )
+    # ============================================================
+# ADMIN REFERRAL LOOKUP
+# ============================================================
+
+async def admin_referral_lookup(query, context):
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data["admin_step"] = "referral_lookup"
+
+    await query.edit_message_text(
+        "🔎 <b>Successful Referral Lookup</b>\n\n"
+        "Send the Telegram User ID of the referrer.\n\n"
+        "Example:\n"
+        "<code>123456789</code>",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="admin",
+                )
+            ]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+async def show_referral_details(query, referrer_id):
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT
+            r.referred_id,
+            r.reward_amount,
+            r.created_at,
+            u.username,
+            u.first_name
+        FROM referrals r
+        LEFT JOIN users u
+            ON u.user_id = r.referred_id
+        WHERE r.referrer_id=?
+          AND r.status='paid'
+        ORDER BY r.id DESC
+    """, (
+        referrer_id,
+    )).fetchall()
+
+    conn.close()
+
+    if not rows:
+        text = (
+            "👥 <b>Successful Referrals</b>\n\n"
+            f"Referrer ID: <code>{referrer_id}</code>\n\n"
+            "No successful referrals found."
+        )
+
+    else:
+        lines = [
+            "👥 <b>Successful Referrals</b>",
+            "",
+            f"Referrer ID: <code>{referrer_id}</code>",
+            f"Total: <b>{len(rows)}</b>",
+            "",
+        ]
+
+        for index, row in enumerate(rows, start=1):
+
+            if row["username"]:
+                person = f"@{row['username']}"
+
+            elif row["first_name"]:
+                person = row["first_name"]
+
+            else:
+                person = "No username"
+
+            lines.append(
+                f"{index}. 👤 <b>{escape(person)}</b>\n"
+                f"   🆔 <code>{row['referred_id']}</code>\n"
+                f"   🎁 Reward: <b>{row['reward_amount']:.2f} ETB</b>"
+            )
+
+        text = "\n\n".join(lines)
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "🔙 Back",
+                    callback_data="admin_referrals",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Admin Panel",
+                    callback_data="admin",
+                )
+            ],
+        ]),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# ADMIN ADD TASK
+# ============================================================
+
+async def start_add_task(query, context):
+    if not is_admin(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["admin_step"] = "task_title"
+
+    await query.edit_message_text(
+        "🎯 <b>Add New Task</b>\n\n"
+        "Step 1/4\n\n"
+        "Send the task title.\n\n"
+        "Example:\n"
+        "<code>Join Smart Money Lab</code>",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "❌ Cancel",
+                    callback_data="admin",
+                )
+            ]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# START COMMAND
+# ============================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    referrer_id = None
+
+    if context.args:
+        try:
+            referrer_id = int(context.args[0])
+        except ValueError:
+            referrer_id = None
+
+    create_or_update_user(
+        user,
+        referred_by=referrer_id,
+    )
+
+    missing = await missing_channels(
+        context.bot,
+        user.id,
+    )
+
+    if missing:
+        set_joined_all(
+            user.id,
+            False,
+        )
+
+        await show_join_required(
+            update,
+            context,
+            missing,
+        )
+        return
+
+    set_joined_all(
+        user.id,
+        True,
+    )
+
+    result = process_referral_reward(
+        user.id,
+    )
+
+    if result:
+        try:
+            await context.bot.send_message(
+                chat_id=result["inviter_id"],
+                text=(
+                    "🎉 <b>New Successful Referral!</b>\n\n"
+                    f"👤 User ID: "
+                    f"<code>{result['referred_id']}</code>\n"
+                    f"🎁 Reward: "
+                    f"<b>{result['amount']:.2f} ETB</b>\n\n"
+                    "The reward has been added to your balance."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(
+                "Could not notify inviter."
+            )
+
+    await update.message.reply_text(
+        "🎉 <b>Welcome to Global Cash Bot!</b>\n\n"
+        "Your account is verified successfully.\n\n"
+        "💰 Earn ETB through referrals and tasks.\n"
+        "Choose an option below:",
+        reply_markup=main_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# VERIFY REQUIRED CHANNELS
+# ============================================================
+
+async def verify_user(
+    query,
+    context,
+):
+    user_id = query.from_user.id
+
+    missing = await missing_channels(
+        context.bot,
+        user_id,
+    )
+
+    if missing:
+        set_joined_all(
+            user_id,
+            False,
+        )
+
+        text = (
+            "❌ <b>Verification Failed</b>\n\n"
+            "You have not joined all required channels yet.\n\n"
+            f"📌 Remaining: <b>{len(missing)}</b>\n\n"
+            "Join the remaining channels and press "
+            "<b>Verify</b> again."
+        )
+
+        await query.edit_message_text(
+            text,
+            reply_markup=channel_keyboard(missing),
+            parse_mode="HTML",
+        )
+        return
+
+    set_joined_all(
+        user_id,
+        True,
+    )
+
+    result = process_referral_reward(
+        user_id,
+    )
+
+    if result:
+        try:
+            await context.bot.send_message(
+                chat_id=result["inviter_id"],
+                text=(
+                    "🎉 <b>New Successful Referral!</b>\n\n"
+                    f"👤 User ID: "
+                    f"<code>{result['referred_id']}</code>\n"
+                    f"🎁 Reward: "
+                    f"<b>{result['amount']:.2f} ETB</b>\n\n"
+                    "The reward has been added to your balance."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(
+                "Could not notify inviter."
+            )
+
+    await query.edit_message_text(
+        "✅ <b>Verified Successfully!</b>\n\n"
+        "All required channels have been verified.\n\n"
+        "Welcome to <b>Global Cash Bot</b> 💰",
+        reply_markup=main_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+# ============================================================
+# TASK VERIFICATION
+# ============================================================
+
+async def verify_task(
+    query,
+    context,
+    task_id,
+):
+    user_id = query.from_user.id
+
+    task = get_task(task_id)
+
+    if not task or not task["active"]:
         await query.answer(
-            "Withdrawal not found.",
+            "This task is no longer available.",
             show_alert=True,
         )
         return
 
-    user = get_user(row["user_id"])
+    if user_task_paid(
+        user_id,
+        task_id,
+    ):
+        await query.answer(
+            "This task is already completed.",
+            show_alert=True,
+        )
+        return
 
-    text = (
-        "💸 <b>Withdrawal Details</b>\n\n"
-        f"🆔 Withdrawal: <code>#{row['id']}</code>\n"
-        f"👤 User: {user_display(user)}\n"
-        f"💰 Amount: <b>{row['amount']:.2f} ETB</b>\n"
-        f"🏦 Method: <b>{html.escape(row['wallet_type'])}</b>\n"
-        f"🔢 Wallet: <code>{html.escape(row['wallet_number'])}</code>\n"
-        f"📌 Status: <b>{html.escape(row['status'])}</b>\n"
-        f"📅 Created: {row['created_at']}\n"
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=task["channel_username"],
+            user_id=user_id,
+        )
+
+        if member.status not in (
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.OWNER,
+        ):
+            await query.answer(
+                "❌ You have not joined the channel yet.",
+                show_alert=True,
+            )
+            return
+
+    except Exception:
+        await query.answer(
+            "Could not verify membership. Try again.",
+            show_alert=True,
+        )
+        return
+
+    reward = float(task["reward"])
+
+    add_balance(
+        user_id,
+        reward,
     )
 
-    buttons = []
+    save_user_task(
+        user_id,
+        task_id,
+        verified=True,
+        paid=True,
+    )
 
-    if row["status"] == "pending":
-        buttons.append([
-            InlineKeyboardButton(
-                "✅ Approve",
-                callback_data=f"approve_wd_{row['id']}",
-            ),
-            InlineKeyboardButton(
-                "❌ Reject",
-                callback_data=f"reject_wd_{row['id']}",
-            ),
-        ])
+    await query.answer(
+        f"🎉 +{reward:.2f} ETB added!",
+        show_alert=True,
+    )
 
-    buttons.append([
-        InlineKeyboardButton(
-            "🔙 Back",
-            callback_data="admin_withdrawals",
+    await show_task(
+        query,
+        user_id,
+        task_id,
+    )
+
+
+# ============================================================
+# WALLET CALLBACK
+# ============================================================
+
+async def save_wallet_from_input(
+    update,
+    context,
+):
+    user = update.effective_user
+
+    wallet_type = context.user_data.get(
+        "wallet_type"
+    )
+
+    if not wallet_type:
+        return False
+
+    number = update.message.text.strip()
+
+    valid = False
+
+    if wallet_type == "CBE":
+        valid = (
+            number.isdigit()
+            and len(number) == 13
+            and number.startswith("1000")
         )
-    ])
 
-    await query.edit_message_text(
-        text,
-        reply_markup=InlineKeyboardMarkup(buttons),
+    elif wallet_type == "Telebirr":
+        valid = (
+            number.isdigit()
+            and len(number) == 10
+            and (
+                number.startswith("09")
+                or number.startswith("07")
+            )
+        )
+
+    if not valid:
+        if wallet_type == "CBE":
+            await update.message.reply_text(
+                "❌ Invalid CBE account number.\n\n"
+                "It must contain exactly 13 digits "
+                "and start with 1000.\n\n"
+                "Please try again."
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Invalid Telebirr number.\n\n"
+                "It must contain exactly 10 digits "
+                "and start with 09 or 07.\n\n"
+                "Please try again."
+            )
+
+        return True
+
+    if wallet_exists_for_other_user(
+        wallet_type,
+        number,
+        user.id,
+    ):
+        await update.message.reply_text(
+            "⚠️ <b>This wallet is already linked "
+            "to another account.</b>\n\n"
+            "For security reasons, one wallet can only "
+            "be connected to one account.",
+            parse_mode="HTML",
+        )
+        return True
+
+    saved = set_wallet(
+        user.id,
+        wallet_type,
+        number,
+    )
+
+    if not saved:
+        await update.message.reply_text(
+            "⚠️ Could not save this wallet.\n\n"
+            "It may already be linked to another account.",
+            parse_mode="HTML",
+        )
+        return True
+
+    context.user_data.pop(
+        "wallet_type",
+        None,
+    )
+
+    context.user_data.pop(
+        "wallet_step",
+        None,
+    )
+
+    await update.message.reply_text(
+        "✅ <b>Wallet Saved Successfully!</b>\n\n"
+        f"💳 Method: <b>{escape(wallet_type)}</b>\n"
+        f"🔢 Number: <code>{escape(number)}</code>\n\n"
+        "You can now use this wallet for withdrawals.",
+        reply_markup=main_keyboard(),
         parse_mode="HTML",
     )
 
+    return True
 
-async def approve_withdrawal(query, withdrawal_id):
-    conn = db_connect()
+
+# ============================================================
+# WITHDRAW REQUEST
+# ============================================================
+
+async def create_withdrawal(
+    update,
+    context,
+):
+    user = update.effective_user
+
+    text = update.message.text.strip()
+
+    try:
+        amount = float(text)
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Please enter a valid number.\n\n"
+            "Example: <code>50</code>",
+            parse_mode="HTML",
+        )
+        return True
+
+    if amount < MIN_WITHDRAWAL:
+        await update.message.reply_text(
+            f"❌ Minimum withdrawal is "
+            f"<b>{MIN_WITHDRAWAL:.2f} ETB</b>.",
+            parse_mode="HTML",
+        )
+        return True
+
+    if amount <= 0:
+        await update.message.reply_text(
+            "❌ Amount must be greater than zero.",
+        )
+        return True
+
+    wallet = get_wallet(
+        user.id,
+    )
+
+    if not wallet:
+        await update.message.reply_text(
+            "❌ No wallet is saved.\n\n"
+            "Please set your wallet first.",
+            reply_markup=wallet_keyboard(),
+            parse_mode="HTML",
+        )
+
+        context.user_data.pop(
+            "withdraw_step",
+            None,
+        )
+
+        return True
+
+    wallet_type, wallet_number = wallet
+
+    conn = db()
+
+    try:
+        # Deduct only if the balance is still sufficient.
+        cur = conn.execute("""
+            UPDATE users
+            SET balance = balance - ?
+            WHERE user_id=?
+              AND balance >= ?
+              AND suspicious=0
+        """, (
+            amount,
+            user.id,
+            amount,
+        ))
+
+        if cur.rowcount != 1:
+            conn.rollback()
+
+            await update.message.reply_text(
+                "❌ Withdrawal could not be created.\n\n"
+                "Your balance may be insufficient or "
+                "your account may be under review.",
+                reply_markup=back_keyboard(),
+                parse_mode="HTML",
+            )
+
+            return True
+
+        cur = conn.execute("""
+            INSERT INTO withdrawals(
+                user_id,
+                amount,
+                wallet_type,
+                wallet_number,
+                status,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?)
+        """, (
+            user.id,
+            amount,
+            wallet_type,
+            wallet_number,
+            "pending",
+            now(),
+        ))
+
+        withdrawal_id = cur.lastrowid
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+
+        logger.exception(
+            "Withdrawal creation failed."
+        )
+
+        await update.message.reply_text(
+            "❌ Something went wrong while creating "
+            "your withdrawal request.",
+            reply_markup=back_keyboard(),
+        )
+
+        return True
+
+    finally:
+        conn.close()
+
+    context.user_data.pop(
+        "withdraw_step",
+        None,
+    )
+
+    await update.message.reply_text(
+        "✅ <b>Withdrawal Request Submitted!</b>\n\n"
+        f"🆔 Request: <b>#{withdrawal_id}</b>\n"
+        f"💰 Amount: <b>{amount:.2f} ETB</b>\n"
+        f"🏦 Method: <b>{escape(wallet_type)}</b>\n"
+        f"🔢 Wallet: <code>{escape(wallet_number)}</code>\n\n"
+        "⏳ Status: <b>Pending</b>\n\n"
+        "Your request is waiting for admin approval.",
+        reply_markup=main_keyboard(),
+        parse_mode="HTML",
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "💳 <b>New Withdrawal</b>\n\n"
+                f"🆔 Request: <b>#{withdrawal_id}</b>\n"
+                f"👤 User ID: <code>{user.id}</code>\n"
+                f"💰 Amount: <b>{amount:.2f} ETB</b>\n"
+                f"🏦 Method: <b>{escape(wallet_type)}</b>\n"
+                f"🔢 Wallet: <code>{escape(wallet_number)}</code>\n\n"
+                "⏳ Status: <b>Pending</b>"
+            ),
+            parse_mode="HTML",
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not notify admin about withdrawal."
+        )
+
+    return True
+
+
+# ============================================================
+# ADMIN WITHDRAWAL ACTIONS
+# ============================================================
+
+async def approve_withdrawal(
+    query,
+    withdrawal_id,
+    context,
+):
+    if not is_admin(query.from_user.id):
+        return
+
+    conn = db()
 
     cur = conn.execute("""
         UPDATE withdrawals
-        SET status = 'approved',
-            processed_at = ?
-        WHERE id = ?
-        AND status = 'pending'
+        SET status='approved'
+        WHERE id=?
+          AND status='pending'
     """, (
-        now(),
         withdrawal_id,
     ))
 
@@ -1826,7 +2175,7 @@ async def approve_withdrawal(query, withdrawal_id):
         conn.close()
 
         await query.answer(
-            "Already processed.",
+            "This withdrawal is already processed.",
             show_alert=True,
         )
         return
@@ -1834,62 +2183,58 @@ async def approve_withdrawal(query, withdrawal_id):
     row = conn.execute("""
         SELECT *
         FROM withdrawals
-        WHERE id = ?
-    """, (withdrawal_id,)).fetchone()
+        WHERE id=?
+    """, (
+        withdrawal_id,
+    )).fetchone()
 
     conn.commit()
     conn.close()
 
     await query.answer(
-        "Withdrawal approved.",
+        "✅ Withdrawal approved.",
         show_alert=True,
     )
 
     try:
-        await query.get_bot().send_message(
+        await context.bot.send_message(
             chat_id=row["user_id"],
             text=(
                 "✅ <b>Withdrawal Approved</b>\n\n"
+                f"🆔 Request: <b>#{row['id']}</b>\n"
                 f"💰 Amount: <b>{row['amount']:.2f} ETB</b>\n"
-                f"🏦 Method: <b>{html.escape(row['wallet_type'])}</b>\n"
-                f"🔢 Wallet: <code>{html.escape(row['wallet_number'])}</code>\n\n"
+                f"🏦 Method: <b>{escape(row['wallet_type'])}</b>\n"
+                f"🔢 Wallet: <code>{escape(row['wallet_number'])}</code>\n\n"
                 "Your withdrawal has been approved."
             ),
             parse_mode="HTML",
         )
     except Exception:
-        logger.exception("Could not notify user.")
-
-    await admin_withdrawals(query)
-
-
-async def reject_withdrawal(query, withdrawal_id):
-    conn = db_connect()
-
-    row = conn.execute("""
-        SELECT *
-        FROM withdrawals
-        WHERE id = ?
-        AND status = 'pending'
-    """, (withdrawal_id,)).fetchone()
-
-    if not row:
-        conn.close()
-
-        await query.answer(
-            "Already processed.",
-            show_alert=True,
+        logger.exception(
+            "Could not notify user about approval."
         )
+
+    await show_admin_withdrawals(
+        query,
+    )
+
+
+async def reject_withdrawal(
+    query,
+    withdrawal_id,
+    context,
+):
+    if not is_admin(query.from_user.id):
         return
+
+    conn = db()
 
     cur = conn.execute("""
         UPDATE withdrawals
-        SET status = 'rejected',
-            processed_at = ?
-        WHERE id = ?
-        AND status = 'pending'
+        SET status='rejected'
+        WHERE id=?
+          AND status='pending'
     """, (
-        now(),
         withdrawal_id,
     ))
 
@@ -1898,16 +2243,25 @@ async def reject_withdrawal(query, withdrawal_id):
         conn.close()
 
         await query.answer(
-            "Already processed.",
+            "This withdrawal is already processed.",
             show_alert=True,
         )
         return
 
-    # Refund exactly once.
+    row = conn.execute("""
+        SELECT *
+        FROM withdrawals
+        WHERE id=?
+    """, (
+        withdrawal_id,
+    )).fetchone()
+
+    # Refund exactly once because status was changed
+    # from pending to rejected in this transaction.
     conn.execute("""
         UPDATE users
         SET balance = balance + ?
-        WHERE user_id = ?
+        WHERE user_id=?
     """, (
         row["amount"],
         row["user_id"],
@@ -1917,284 +2271,100 @@ async def reject_withdrawal(query, withdrawal_id):
     conn.close()
 
     await query.answer(
-        "Withdrawal rejected and refunded.",
+        "❌ Withdrawal rejected and refunded.",
         show_alert=True,
     )
 
     try:
-        await query.get_bot().send_message(
+        await context.bot.send_message(
             chat_id=row["user_id"],
             text=(
                 "❌ <b>Withdrawal Rejected</b>\n\n"
+                f"🆔 Request: <b>#{row['id']}</b>\n"
                 f"💰 Amount: <b>{row['amount']:.2f} ETB</b>\n\n"
-                "The amount has been returned to your balance.\n"
-                f"📞 Support: {SUPPORT_USERNAME}"
+                "The amount has been returned to your balance."
             ),
             parse_mode="HTML",
         )
     except Exception:
-        logger.exception("Could not notify user.")
-
-    await admin_withdrawals(query)
-
-
-# =========================================================
-# ADMIN SUSPICIOUS
-# =========================================================
-
-async def admin_suspicious(query):
-    conn = db_connect()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM users
-        WHERE suspicious = 1
-        ORDER BY user_id DESC
-        LIMIT 30
-    """).fetchall()
-
-    conn.close()
-
-    if not rows:
-        await query.edit_message_text(
-            "⚠️ <b>Suspicious Accounts</b>\n\n"
-            "No suspicious accounts.",
-            reply_markup=admin_keyboard(),
-            parse_mode="HTML",
-        )
-        return
-
-    text = "⚠️ <b>Suspicious Accounts</b>\n\n"
-
-    for row in rows:
-        text += (
-            f"👤 {user_display(row)}\n"
-            f"💰 Balance: {row['balance']:.2f} ETB\n"
-            f"🆔 ID: <code>{row['user_id']}</code>\n\n"
+        logger.exception(
+            "Could not notify user about rejection."
         )
 
-    await query.edit_message_text(
-        text,
-        reply_markup=admin_keyboard(),
-        parse_mode="HTML",
+    await show_admin_withdrawals(
+        query,
     )
 
 
-# =========================================================
-# ADMIN ADD TASK
-# =========================================================
+# ============================================================
+# CALLBACK HANDLER
+# ============================================================
 
-async def admin_add_task_start(query, context):
-    context.user_data["admin_state"] = "task_title"
-
-    await query.edit_message_text(
-        "🎯 <b>Add New Task</b>\n\n"
-        "Enter task title.\n\n"
-        "Example:\n"
-        "<code>Join Smart Money Channel</code>",
-        reply_markup=admin_cancel_keyboard(),
-        parse_mode="HTML",
-    )
-
-
-# =========================================================
-# CALLBACKS
-# =========================================================
-
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     query = update.callback_query
 
     await query.answer()
 
-    user = update.effective_user
     data = query.data
+    user = query.from_user
 
-    create_or_update_user(user)
-
-    # -----------------------------------------------------
-    # ADMIN SECURITY
-    # -----------------------------------------------------
-
-    admin_callbacks = (
-        "admin",
-        "admin_stats",
-        "admin_reward",
-        "admin_withdrawals",
-        "admin_referrals",
-        "admin_suspicious",
-        "admin_cancel",
-        "admin_add_task",
+    create_or_update_user(
+        user,
     )
 
-    if data.startswith("admin_") or data.startswith("approve_wd_") or data.startswith("reject_wd_"):
-        if user.id != ADMIN_ID:
-            await query.answer(
-                "⛔ Admin only.",
-                show_alert=True,
-            )
-            return
+    # ----------------------------
+    # Home
+    # ----------------------------
 
-    if data == "admin":
+    if data == "home":
         context.user_data.clear()
 
-        await query.edit_message_text(
-            "👑 <b>Global Cash Bot Admin Panel</b>\n\n"
-            "Choose an option:",
-            reply_markup=admin_keyboard(),
-            parse_mode="HTML",
-        )
-        return
-
-    if data == "admin_stats":
-        await admin_stats(query)
-        return
-
-    if data == "admin_reward":
-        await admin_reward(query, context)
-        return
-
-    if data == "admin_withdrawals":
-        await admin_withdrawals(query)
-        return
-
-    if data == "admin_referrals":
-        await admin_referral_list(query)
-        return
-
-    if data.startswith("admin_ref_"):
-        try:
-            referrer_id = int(data.split("_")[-1])
-            await admin_referral_detail(
-                query,
-                referrer_id,
-            )
-        except ValueError:
-            pass
-
-        return
-
-    if data == "admin_suspicious":
-        await admin_suspicious(query)
-        return
-
-    if data == "admin_cancel":
-        context.user_data.clear()
-
-        await query.edit_message_text(
-            "❌ Cancelled.",
-            reply_markup=admin_keyboard(),
-            parse_mode="HTML",
-        )
-        return
-
-    if data.startswith("admin_wd_"):
-        try:
-            withdrawal_id = int(data.split("_")[-1])
-            await admin_withdrawal_detail(
-                query,
-                withdrawal_id,
-            )
-        except ValueError:
-            pass
-
-        return
-
-    if data.startswith("approve_wd_"):
-        try:
-            withdrawal_id = int(data.split("_")[-1])
-            await approve_withdrawal(
-                query,
-                withdrawal_id,
-            )
-        except ValueError:
-            pass
-
-        return
-
-    if data.startswith("reject_wd_"):
-        try:
-            withdrawal_id = int(data.split("_")[-1])
-            await reject_withdrawal(
-                query,
-                withdrawal_id,
-            )
-        except ValueError:
-            pass
-
-        return
-
-    # -----------------------------------------------------
-    # VERIFY
-    # -----------------------------------------------------
-
-    if data == "verify":
-        missing = await check_channel_membership(
+        missing = await missing_channels(
             context.bot,
             user.id,
         )
 
         if missing:
-            set_joined_all(user.id, False)
-
-            names = "\n".join(
-                f"• {html.escape(username)}"
-                for username, _ in missing
+            set_joined_all(
+                user.id,
+                False,
             )
 
-            await query.edit_message_text(
-                "❌ <b>Verification Failed</b>\n\n"
-                "እነዚህ channels ገና አልተረጋገጡም፦\n\n"
-                f"{names}\n\n"
-                "እባክዎ በመጀመሪያ ይቀላቀሉ፣ "
-                "ከዚያ Verify ይጫኑ።",
-                reply_markup=join_keyboard(missing),
-                parse_mode="HTML",
+            await show_join_required(
+                update,
+                context,
+                missing,
             )
             return
 
-        set_joined_all(user.id, True)
-
-        result = process_referral_reward(user.id)
-
-        if result:
-            try:
-                await context.bot.send_message(
-                    chat_id=result["referrer_id"],
-                    text=(
-                        "🎉 <b>Successful Referral!</b>\n\n"
-                        f"💰 Reward: <b>{result['reward']:.2f} ETB</b>\n"
-                        "has been added to your balance."
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception:
-                logger.exception(
-                    "Referral notification failed."
-                )
-
-        await query.edit_message_text(
-            "✅ <b>Verified Successfully!</b>\n\n"
-            "🎉 ሁሉንም required channels በትክክል አረጋግጠዋል።\n\n"
-            "ከታች menu ይጠቀሙ።",
-            reply_markup=main_menu_keyboard(),
-            parse_mode="HTML",
+        set_joined_all(
+            user.id,
+            True,
         )
 
+        await show_home(
+            query,
+            user.id,
+        )
         return
 
-    # -----------------------------------------------------
-    # HOME
-    # -----------------------------------------------------
+    # ----------------------------
+    # Verify
+    # ----------------------------
 
-    if data == "home":
-        context.user_data.clear()
-
-        await show_home(query)
+    if data == "verify":
+        await verify_user(
+            query,
+            context,
+        )
         return
 
-    # -----------------------------------------------------
-    # BALANCE
-    # -----------------------------------------------------
+    # ----------------------------
+    # Main menu
+    # ----------------------------
 
     if data == "balance":
         await show_balance(
@@ -2203,20 +2373,12 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # -----------------------------------------------------
-    # REFERRAL
-    # -----------------------------------------------------
-
     if data == "referral":
         await show_referral(
             query,
             user.id,
         )
         return
-
-    # -----------------------------------------------------
-    # TASKS
-    # -----------------------------------------------------
 
     if data == "tasks":
         await show_tasks(
@@ -2225,36 +2387,13 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith("task_"):
-        try:
-            task_id = int(data.split("_")[-1])
-            await show_task(
-                query,
-                user.id,
-                task_id,
-            )
-        except ValueError:
-            pass
-
+    if data == "withdraw":
+        await show_withdraw(
+            query,
+            user.id,
+            context,
+        )
         return
-
-    if data.startswith("verify_task_"):
-        try:
-            task_id = int(data.split("_")[-1])
-
-            await verify_task(
-                query,
-                user.id,
-                task_id,
-            )
-        except ValueError:
-            pass
-
-        return
-
-    # -----------------------------------------------------
-    # WALLET
-    # -----------------------------------------------------
 
     if data == "wallet":
         await show_wallet(
@@ -2263,75 +2402,258 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "wallet_cbe":
-        await ask_wallet_number(
-            query,
-            context,
-            "CBE",
-        )
-        return
-
-    if data == "wallet_telebirr":
-        await ask_wallet_number(
-            query,
-            context,
-            "Telebirr",
-        )
-        return
-
-    # -----------------------------------------------------
-    # WITHDRAW
-    # -----------------------------------------------------
-
-    if data == "withdraw":
-        await show_withdraw(
+    if data == "support":
+        await show_support(
             query,
             user.id,
         )
         return
 
-    # -----------------------------------------------------
-    # SUPPORT
-    # -----------------------------------------------------
+    # ----------------------------
+    # Share referral
+    # ----------------------------
 
-    if data == "support":
-        await show_support(query)
+    if data == "share_ref":
+        link = (
+            f"https://t.me/{BOT_USERNAME}"
+            f"?start={user.id}"
+        )
+
+        await query.answer(
+            "Copy your referral link from the message.",
+            show_alert=True,
+        )
+
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=(
+                "📤 <b>Your Referral Link</b>\n\n"
+                f"<code>{escape(link)}</code>\n\n"
+                "Share this link with your friends."
+            ),
+            parse_mode="HTML",
+        )
+        return
+
+    # ----------------------------
+    # Wallet selection
+    # ----------------------------
+
+    if data == "wallet_cbe":
+        await ask_wallet(
+            query,
+            user.id,
+            "CBE",
+            context,
+        )
+        return
+
+    if data == "wallet_telebirr":
+        await ask_wallet(
+            query,
+            user.id,
+            "Telebirr",
+            context,
+        )
+        return
+
+    # ----------------------------
+    # Tasks
+    # ----------------------------
+
+    if data.startswith("task_"):
+        try:
+            task_id = int(
+                data.split("_", 1)[1]
+            )
+        except ValueError:
+            return
+
+        await show_task(
+            query,
+            user.id,
+            task_id,
+        )
+        return
+
+    if data.startswith("verify_task_"):
+        try:
+            task_id = int(
+                data.split("_", 2)[2]
+            )
+        except ValueError:
+            return
+
+        await verify_task(
+            query,
+            context,
+            task_id,
+        )
+        return
+
+    # ========================================================
+    # ADMIN
+    # ========================================================
+
+    if data == "admin":
+        await show_admin(
+            query,
+        )
+        return
+
+    if data == "admin_stats":
+        await show_admin_stats(
+            query,
+        )
+        return
+
+    if data == "admin_reward":
+        await show_admin_reward(
+            query,
+        )
+        return
+
+    if data == "admin_change_reward":
+        if not is_admin(user.id):
+            return
+
+        context.user_data.clear()
+        context.user_data["admin_step"] = "reward"
+
+        await query.edit_message_text(
+            "💰 <b>Change Referral Reward</b>\n\n"
+            f"Current Reward: "
+            f"<b>{get_referral_reward():.2f} ETB</b>\n\n"
+            "Send the new reward amount.\n\n"
+            "Examples:\n"
+            "<code>1.00</code>\n"
+            "<code>2.00</code>\n"
+            "<code>5.00</code>\n\n"
+            "This applies only to new successful referrals.",
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "❌ Cancel",
+                        callback_data="admin_reward",
+                    )
+                ]
+            ]),
+            parse_mode="HTML",
+        )
+        return
+
+    if data == "admin_referrals":
+        await show_admin_referrals(
+            query,
+        )
+        return
+
+    if data == "admin_referral_lookup":
+        await admin_referral_lookup(
+            query,
+            context,
+        )
+        return
+
+    if data == "admin_withdrawals":
+        await show_admin_withdrawals(
+            query,
+        )
+        return
+
+    if data == "admin_suspicious":
+        await show_admin_suspicious(
+            query,
+        )
+        return
+
+    if data == "admin_add_task":
+        await start_add_task(
+            query,
+            context,
+        )
+        return
+
+    # ----------------------------
+    # Approve / Reject withdrawal
+    # ----------------------------
+
+    if data.startswith("approve_wd_"):
+        try:
+            withdrawal_id = int(
+                data.split("_")[-1]
+            )
+        except ValueError:
+            return
+
+        await approve_withdrawal(
+            query,
+            withdrawal_id,
+            context,
+        )
+        return
+
+    if data.startswith("reject_wd_"):
+        try:
+            withdrawal_id = int(
+                data.split("_")[-1]
+            )
+        except ValueError:
+            return
+
+        await reject_withdrawal(
+            query,
+            withdrawal_id,
+            context,
+        )
         return
 
 
-# =========================================================
-# TEXT HANDLER
-# =========================================================
+# ============================================================
+# MESSAGE HANDLER
+# ============================================================
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def message_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     user = update.effective_user
+
+    if not update.message:
+        return
+
     text = update.message.text.strip()
 
-    create_or_update_user(user)
+    # ========================================================
+    # ADMIN STEPS
+    # ========================================================
 
-    # -----------------------------------------------------
-    # ADMIN INPUT
-    # -----------------------------------------------------
+    if is_admin(user.id):
 
-    if user.id == ADMIN_ID:
-        state = context.user_data.get("admin_state")
+        admin_step = context.user_data.get(
+            "admin_step"
+        )
 
-        if state == "reward":
+        # ----------------------------
+        # Referral reward
+        # ----------------------------
+
+        if admin_step == "reward":
+
             try:
                 amount = float(text)
 
-                if amount <= 0:
-                    raise ValueError
-
-                if amount > 100000:
-                    raise ValueError
-
             except ValueError:
                 await update.message.reply_text(
-                    "❌ Invalid amount.\n\n"
-                    "Enter a positive number.\n"
+                    "❌ Please send a valid number.\n\n"
                     "Example: <code>2.00</code>",
                     parse_mode="HTML",
+                )
+                return
+
+            if amount <= 0:
+                await update.message.reply_text(
+                    "❌ Reward must be greater than zero."
                 )
                 return
 
@@ -2340,383 +2662,385 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"{amount:.2f}",
             )
 
-            context.user_data.clear()
+            context.user_data.pop(
+                "admin_step",
+                None,
+            )
 
             await update.message.reply_text(
-                "✅ <b>Referral Reward Updated</b>\n\n"
+                "✅ <b>Referral Reward Updated!</b>\n\n"
                 f"New Reward: <b>{amount:.2f} ETB</b>\n\n"
-                "This new amount applies to new successful "
-                "referrals only.\n\n"
-                "Previously paid referrals remain unchanged.",
-                reply_markup=admin_keyboard(),
+                "This new amount will apply only to "
+                "new successful referrals.\n\n"
+                "Previously paid referrals will not change.",
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "💰 Reward Settings",
+                            callback_data="admin_reward",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🛠 Admin Panel",
+                            callback_data="admin",
+                        )
+                    ],
+                ]),
                 parse_mode="HTML",
             )
             return
 
-        if state == "task_title":
-            context.user_data["task_title"] = text
-            context.user_data["admin_state"] = "task_description"
+        # ----------------------------
+        # Referral lookup
+        # ----------------------------
 
-            await update.message.reply_text(
-                "📝 Enter task description.",
-                reply_markup=admin_cancel_keyboard(),
-            )
-            return
+        if admin_step == "referral_lookup":
 
-        if state == "task_description":
-            context.user_data["task_description"] = text
-            context.user_data["admin_state"] = "task_channel"
-
-            await update.message.reply_text(
-                "📢 Enter channel username.\n\n"
-                "Example:\n"
-                "<code>@MyChannel</code>",
-                reply_markup=admin_cancel_keyboard(),
-                parse_mode="HTML",
-            )
-            return
-
-        if state == "task_channel":
-            channel = text
-
-            if not channel.startswith("@"):
-                await update.message.reply_text(
-                    "❌ Channel username must start with @.\n"
-                    "Example: <code>@MyChannel</code>",
-                    parse_mode="HTML",
-                )
-                return
-
-            context.user_data["task_channel"] = channel
-            context.user_data["admin_state"] = "task_url"
-
-            await update.message.reply_text(
-                "🔗 Enter channel URL.\n\n"
-                "Example:\n"
-                "<code>https://t.me/MyChannel</code>",
-                reply_markup=admin_cancel_keyboard(),
-                parse_mode="HTML",
-            )
-            return
-
-        if state == "task_url":
-            if not text.startswith("https://t.me/"):
-                await update.message.reply_text(
-                    "❌ Invalid Telegram URL.",
-                    parse_mode="HTML",
-                )
-                return
-
-            context.user_data["task_url"] = text
-            context.user_data["admin_state"] = "task_reward"
-
-            await update.message.reply_text(
-                "💰 Enter task reward in ETB.\n\n"
-                "Example: <code>2</code>",
-                reply_markup=admin_cancel_keyboard(),
-                parse_mode="HTML",
-            )
-            return
-
-        if state == "task_reward":
             try:
-                reward = float(text)
-
-                if reward <= 0:
-                    raise ValueError
+                referrer_id = int(text)
 
             except ValueError:
                 await update.message.reply_text(
-                    "❌ Invalid reward.",
-                    parse_mode="HTML",
+                    "❌ Please send a valid Telegram User ID."
                 )
                 return
 
-            title = context.user_data["task_title"]
-            description = context.user_data["task_description"]
-            channel = context.user_data["task_channel"]
-            url = context.user_data["task_url"]
+            context.user_data.pop(
+                "admin_step",
+                None,
+            )
 
-            conn = db_connect()
+            conn = db()
 
-            conn.execute("""
-                INSERT INTO tasks(
-                    title,
-                    description,
-                    channel_username,
-                    channel_url,
-                    reward,
-                    active,
-                    created_at
-                )
-                VALUES(?, ?, ?, ?, ?, 1, ?)
+            rows = conn.execute("""
+                SELECT
+                    r.referred_id,
+                    r.reward_amount,
+                    u.username,
+                    u.first_name
+                FROM referrals r
+                LEFT JOIN users u
+                    ON u.user_id=r.referred_id
+                WHERE r.referrer_id=?
+                  AND r.status='paid'
+                ORDER BY r.id DESC
             """, (
+                referrer_id,
+            )).fetchall()
+
+            conn.close()
+
+            if not rows:
+                result_text = (
+                    "👥 <b>Successful Referrals</b>\n\n"
+                    f"Referrer ID: <code>{referrer_id}</code>\n\n"
+                    "No successful referrals found."
+                )
+
+            else:
+                lines = [
+                    "👥 <b>Successful Referrals</b>",
+                    "",
+                    f"Referrer ID: <code>{referrer_id}</code>",
+                    f"Total: <b>{len(rows)}</b>",
+                    "",
+                ]
+
+                for index, row in enumerate(
+                    rows,
+                    start=1,
+                ):
+                    if row["username"]:
+                        name = f"@{row['username']}"
+                    elif row["first_name"]:
+                        name = row["first_name"]
+                    else:
+                        name = "No username"
+
+                    lines.append(
+                        f"{index}. 👤 <b>{escape(name)}</b>\n"
+                        f"   🆔 <code>{row['referred_id']}</code>\n"
+                        f"   🎁 {row['reward_amount']:.2f} ETB"
+                    )
+
+                result_text = "\n\n".join(
+                    lines
+                )
+
+            await update.message.reply_text(
+                result_text,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "👥 Referrals",
+                            callback_data="admin_referrals",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🛠 Admin Panel",
+                            callback_data="admin",
+                        )
+                    ],
+                ]),
+                parse_mode="HTML",
+            )
+            return
+
+        # ----------------------------
+        # Add Task: title
+        # ----------------------------
+
+        if admin_step == "task_title":
+
+            context.user_data["task_title"] = text
+            context.user_data["admin_step"] = "task_description"
+
+            await update.message.reply_text(
+                "🎯 <b>Add New Task</b>\n\n"
+                "Step 2/4\n\n"
+                "Send the task description.",
+                parse_mode="HTML",
+            )
+            return
+
+        # ----------------------------
+        # Add Task: description
+        # ----------------------------
+
+        if admin_step == "task_description":
+
+            context.user_data["task_description"] = text
+            context.user_data["admin_step"] = "task_channel"
+
+            await update.message.reply_text(
+                "🎯 <b>Add New Task</b>\n\n"
+                "Step 3/4\n\n"
+                "Send the channel username.\n\n"
+                "Example:\n"
+                "<code>@MyChannel</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        # ----------------------------
+        # Add Task: channel
+        # ----------------------------
+
+        if admin_step == "task_channel":
+
+            username = text.strip()
+
+            if not username.startswith("@"):
+                username = "@" + username
+
+            context.user_data["task_channel"] = username
+            context.user_data["task_url"] = (
+                f"https://t.me/{username.lstrip('@')}"
+            )
+
+            context.user_data["admin_step"] = "task_reward"
+
+            await update.message.reply_text(
+                "🎯 <b>Add New Task</b>\n\n"
+                "Step 4/4\n\n"
+                "Send the task reward in ETB.\n\n"
+                "Example:\n"
+                "<code>1.50</code>",
+                parse_mode="HTML",
+            )
+            return
+
+        # ----------------------------
+        # Add Task: reward
+        # ----------------------------
+
+        if admin_step == "task_reward":
+
+            try:
+                reward = float(text)
+
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Please enter a valid reward amount."
+                )
+                return
+
+            if reward <= 0:
+                await update.message.reply_text(
+                    "❌ Reward must be greater than zero."
+                )
+                return
+
+            title = context.user_data.get(
+                "task_title",
+                "Task",
+            )
+
+            description = context.user_data.get(
+                "task_description",
+                "",
+            )
+
+            channel = context.user_data.get(
+                "task_channel",
+                "",
+            )
+
+            url = context.user_data.get(
+                "task_url",
+                "",
+            )
+
+            task_id = create_task(
                 title,
                 description,
                 channel,
                 url,
                 reward,
-                now(),
-            ))
-
-            conn.commit()
-            conn.close()
+            )
 
             context.user_data.clear()
 
             await update.message.reply_text(
-                "✅ <b>Task Added Successfully</b>\n\n"
-                f"🎯 {html.escape(title)}\n"
+                "✅ <b>Task Created Successfully!</b>\n\n"
+                f"🆔 Task ID: <b>{task_id}</b>\n"
+                f"🎯 Title: <b>{escape(title)}</b>\n"
+                f"📢 Channel: <b>{escape(channel)}</b>\n"
                 f"💰 Reward: <b>{reward:.2f} ETB</b>",
-                reply_markup=admin_keyboard(),
-                parse_mode="HTML",
-            )
-            return
-
-    # -----------------------------------------------------
-    # WALLET INPUT
-    # -----------------------------------------------------
-
-    wallet_type = context.user_data.get("wallet_type")
-
-    if wallet_type:
-        number = re.sub(r"\s+", "", text)
-
-        if wallet_type == "CBE":
-            if not re.fullmatch(r"1000\d{9}", number):
-                await update.message.reply_text(
-                    "❌ Invalid CBE account.\n\n"
-                    "CBE must be exactly 13 digits "
-                    "and start with 1000.\n\n"
-                    "Example:\n"
-                    "<code>1000123456789</code>",
-                    parse_mode="HTML",
-                )
-                return
-
-        elif wallet_type == "Telebirr":
-            if not re.fullmatch(r"(09|07)\d{8}", number):
-                await update.message.reply_text(
-                    "❌ Invalid Telebirr number.\n\n"
-                    "Telebirr must be exactly 10 digits "
-                    "and start with 09 or 07.\n\n"
-                    "Example:\n"
-                    "<code>0912345678</code>",
-                    parse_mode="HTML",
-                )
-                return
-
-        if wallet_exists_for_other_user(
-            user.id,
-            wallet_type,
-            number,
-        ):
-            await update.message.reply_text(
-                "⚠️ <b>Wallet Already Used</b>\n\n"
-                "This wallet is already connected to another account.\n\n"
-                "For security, one wallet cannot be used by multiple accounts.",
-                parse_mode="HTML",
-            )
-            return
-
-        success = save_wallet(
-            user.id,
-            wallet_type,
-            number,
-        )
-
-        if not success:
-            await update.message.reply_text(
-                "❌ Could not save this wallet.",
-                parse_mode="HTML",
-            )
-            return
-
-        context.user_data.pop("wallet_type", None)
-
-        await update.message.reply_text(
-            "✅ <b>Wallet Saved Successfully</b>\n\n"
-            f"🏦 Method: <b>{wallet_type}</b>\n"
-            f"🔢 Number: <code>{number}</code>\n\n"
-            "ይህ wallet አሁን active wallet ነው።",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "💸 Withdraw",
-                        callback_data="withdraw",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "🔙 Back",
-                        callback_data="home",
-                    )
-                ],
-            ]),
-            parse_mode="HTML",
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # WITHDRAW INPUT
-    # -----------------------------------------------------
-
-    if context.user_data.get("withdraw_mode"):
-        context.user_data.pop("withdraw_mode", None)
-
-        raw = text.replace(",", "").strip()
-
-        try:
-            amount = float(raw)
-
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Invalid amount.\n\n"
-                "Example: <code>30</code>",
-                parse_mode="HTML",
-            )
-            return
-
-        if amount < MIN_WITHDRAWAL:
-            await update.message.reply_text(
-                f"❌ Minimum withdrawal is "
-                f"<b>{MIN_WITHDRAWAL:.2f} ETB</b>.",
-                parse_mode="HTML",
-            )
-            return
-
-        if amount <= 0:
-            await update.message.reply_text(
-                "❌ Amount must be greater than zero.",
-                parse_mode="HTML",
-            )
-            return
-
-        wallet = get_wallet(user.id)
-
-        if not wallet:
-            await update.message.reply_text(
-                "⚠️ Wallet not found. Please save a wallet first.",
-                reply_markup=wallet_keyboard(),
-                parse_mode="HTML",
-            )
-            return
-
-        balance = get_balance(user.id)
-
-        if amount > balance:
-            await update.message.reply_text(
-                "❌ <b>Insufficient Balance</b>\n\n"
-                f"Available: <b>{balance:.2f} ETB</b>\n"
-                f"Requested: <b>{amount:.2f} ETB</b>",
-                parse_mode="HTML",
-            )
-            return
-
-        success, result = create_withdrawal(
-            user.id,
-            amount,
-        )
-
-        if not success:
-            await update.message.reply_text(
-                f"❌ {html.escape(str(result))}",
-                parse_mode="HTML",
-            )
-            return
-
-        withdrawal_id = result
-
-        await update.message.reply_text(
-            "✅ <b>Withdrawal Submitted</b>\n\n"
-            f"🆔 Request: <code>#{withdrawal_id}</code>\n"
-            f"💰 Amount: <b>{amount:.2f} ETB</b>\n"
-            f"🏦 Method: <b>{html.escape(wallet[0])}</b>\n"
-            f"🔢 Wallet: <code>{html.escape(wallet[1])}</code>\n\n"
-            "⏳ Status: <b>Pending</b>\n\n"
-            "Admin approval እስኪደርስ ይጠብቁ።",
-            reply_markup=back_keyboard(),
-            parse_mode="HTML",
-        )
-
-        # Notify admin
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "💳 <b>New Withdrawal</b>\n\n"
-                    f"🆔 Request: <code>#{withdrawal_id}</code>\n"
-                    f"👤 User ID: <code>{user.id}</code>\n"
-                    f"👤 User: {html.escape(user.username or user.first_name or 'Unknown')}\n"
-                    f"💰 Amount: <b>{amount:.2f} ETB</b>\n"
-                    f"🏦 Method: <b>{html.escape(wallet[0])}</b>\n"
-                    f"🔢 Wallet: <code>{html.escape(wallet[1])}</code>\n\n"
-                    "⏳ Status: <b>Pending</b>"
-                ),
                 reply_markup=InlineKeyboardMarkup([
                     [
                         InlineKeyboardButton(
-                            "👀 Review",
-                            callback_data=f"admin_wd_{withdrawal_id}",
+                            "🎯 Tasks",
+                            callback_data="tasks",
                         )
-                    ]
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "🛠 Admin Panel",
+                            callback_data="admin",
+                        )
+                    ],
                 ]),
                 parse_mode="HTML",
             )
+            return
 
-        except Exception:
-            logger.exception(
-                "Could not notify admin about withdrawal."
-            )
+    # ========================================================
+    # WALLET INPUT
+    # ========================================================
 
-        return
+    wallet_step = context.user_data.get(
+        "wallet_step"
+    )
 
-    # -----------------------------------------------------
-    # UNKNOWN TEXT
-    # -----------------------------------------------------
+    if wallet_step == "number":
+        handled = await save_wallet_from_input(
+            update,
+            context,
+        )
+
+        if handled:
+            return
+
+    # ========================================================
+    # WITHDRAW INPUT
+    # ========================================================
+
+    withdraw_step = context.user_data.get(
+        "withdraw_step"
+    )
+
+    if withdraw_step == "amount":
+        handled = await create_withdrawal(
+            update,
+            context,
+        )
+
+        if handled:
+            return
+
+    # ========================================================
+    # NORMAL TEXT
+    # ========================================================
 
     await update.message.reply_text(
-        "ℹ️ እባክዎ ከ menu buttons ይጠቀሙ።",
-        reply_markup=main_menu_keyboard(),
+        "Please use the buttons below.",
+        reply_markup=main_keyboard(),
     )
 
 
-# =========================================================
-# CANCEL
-# =========================================================
+# ============================================================
+# ADMIN COMMAND
+# ============================================================
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.message.reply_text(
+            "⛔ Admin only."
+        )
+        return
+
     context.user_data.clear()
 
     await update.message.reply_text(
-        "❌ Cancelled.\n\n"
-        "ወደ Main Menu ተመልሰዋል።",
-        reply_markup=main_menu_keyboard(),
+        "🛠 <b>Global Cash Bot Admin Panel</b>\n\n"
+        "Choose an option:",
+        reply_markup=admin_keyboard(),
+        parse_mode="HTML",
     )
 
 
-# =========================================================
-# ERROR HANDLER
-# =========================================================
+# ============================================================
+# CANCEL COMMAND
+# ============================================================
 
-async def error_handler(update, context):
+async def cancel_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "❌ Action cancelled.",
+        reply_markup=main_keyboard(),
+    )
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
     logger.exception(
         "Unhandled exception:",
         exc_info=context.error,
     )
 
 
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
-    print("========================================")
-    print("Global Cash Bot")
-    print("Starting...")
-    print(f"Admin ID: {ADMIN_ID}")
-    print("========================================")
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    if not ADMIN_ID:
+        raise RuntimeError(
+            "ADMIN_ID environment variable is missing."
+        )
 
     init_db()
 
@@ -2726,41 +3050,50 @@ def main():
         .build()
     )
 
-    # Commands
     application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("admin", admin_command)
-    )
-
-    application.add_handler(
-        CommandHandler("cancel", cancel)
-    )
-
-    # Callback buttons
-    application.add_handler(
-        CallbackQueryHandler(callbacks)
-    )
-
-    # Normal text
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            handle_text,
+        CommandHandler(
+            "start",
+            start,
         )
     )
 
-    # Errors
-    application.add_error_handler(
-        error_handler
+    application.add_handler(
+        CommandHandler(
+            "admin",
+            admin_command,
+        )
     )
 
-    print("Bot polling started successfully.")
+    application.add_handler(
+        CommandHandler(
+            "cancel",
+            cancel_command,
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            callback_handler,
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_handler,
+        )
+    )
+
+    application.add_error_handler(
+        error_handler,
+    )
+
+    logger.info(
+        "Global Cash Bot is starting..."
+    )
 
     application.run_polling(
-        drop_pending_updates=True
+        drop_pending_updates=True,
     )
 
 
