@@ -528,7 +528,7 @@ def channel_keyboard(missing):
 
     buttons.append([
         InlineKeyboardButton(
-            "✅ Verify",
+            "✅ Verify | አረጋግጥ",
             callback_data="verify",
         )
     ])
@@ -539,76 +539,76 @@ def channel_keyboard(missing):
 def main_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💰 Balance", callback_data="balance"),
-            InlineKeyboardButton("👥 Referral", callback_data="referral"),
+            InlineKeyboardButton("💰 Balance | ቀሪ ሂሳብ", callback_data="balance"),
+            InlineKeyboardButton("👥 Referral | ሪፈራል", callback_data="referral"),
         ],
         [
-            InlineKeyboardButton("🎯 Tasks", callback_data="tasks"),
-            InlineKeyboardButton("💸 Withdraw", callback_data="withdraw"),
+            InlineKeyboardButton("🎯 Tasks | ተግባራት", callback_data="tasks"),
+            InlineKeyboardButton("💸 Withdraw | ማውጣት", callback_data="withdraw"),
         ],
         [
-            InlineKeyboardButton("👛 Wallet", callback_data="wallet"),
-            InlineKeyboardButton("📞 Support", callback_data="support"),
+            InlineKeyboardButton("👛 Wallet | ዋሌት", callback_data="wallet"),
+            InlineKeyboardButton("📞 Support | ድጋፍ", callback_data="support"),
         ],
     ])
 
 
 def back_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back", callback_data="home")]
+        [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")]
     ])
 
 
 def balance_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💸 Withdraw", callback_data="withdraw"),
-            InlineKeyboardButton("👥 Referral", callback_data="referral"),
+            InlineKeyboardButton("💸 Withdraw | ማውጣት", callback_data="withdraw"),
+            InlineKeyboardButton("👥 Referral | ሪፈራል", callback_data="referral"),
         ],
-        [InlineKeyboardButton("🔙 Back", callback_data="home")],
+        [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")],
     ])
 
 
 def referral_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Share Link", callback_data="share_ref")],
-        [InlineKeyboardButton("🔙 Back", callback_data="home")],
+        [InlineKeyboardButton("📤 Share Link | ሊንክ አጋራ", callback_data="share_ref")],
+        [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")],
     ])
 
 
 def wallet_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🏦 CBE", callback_data="wallet_cbe"),
-            InlineKeyboardButton("📱 Telebirr", callback_data="wallet_telebirr"),
+            InlineKeyboardButton("🏦 CBE | ንግድ ባንክ", callback_data="wallet_cbe"),
+            InlineKeyboardButton("📱 Telebirr | ቴሌብር", callback_data="wallet_telebirr"),
         ],
-        [InlineKeyboardButton("🔙 Back", callback_data="home")],
+        [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")],
     ])
 
 
 def withdraw_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👛 Set / Change Wallet", callback_data="wallet")],
-        [InlineKeyboardButton("🔙 Back", callback_data="home")],
+        [InlineKeyboardButton("👛 Set / Change Wallet | ዋሌት አስቀምጥ/ቀይር", callback_data="wallet")],
+        [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")],
     ])
 
 
 def admin_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("📊 Statistics", callback_data="admin_stats"),
-            InlineKeyboardButton("💰 Reward", callback_data="admin_reward"),
+            InlineKeyboardButton("📊 Statistics | ስታቲስቲክስ", callback_data="admin_stats"),
+            InlineKeyboardButton("💰 Reward | ሽልማት", callback_data="admin_reward"),
         ],
         [
-            InlineKeyboardButton("👥 Referrals", callback_data="admin_referrals"),
-            InlineKeyboardButton("💸 Withdrawals", callback_data="admin_withdrawals"),
+            InlineKeyboardButton("👥 Referrals | ሪፈራሎች", callback_data="admin_referrals"),
+            InlineKeyboardButton("💸 Withdrawals | ማውጫዎች", callback_data="admin_withdrawals"),
         ],
         [
-            InlineKeyboardButton("⚠️ Suspicious", callback_data="admin_suspicious"),
-            InlineKeyboardButton("🎯 Add Task", callback_data="admin_add_task"),
+            InlineKeyboardButton("⚠️ Suspicious | ጥርጣሬ", callback_data="admin_suspicious"),
+            InlineKeyboardButton("🎯 Add Task | ተግባር ጨምር", callback_data="admin_add_task"),
         ],
         [
-            InlineKeyboardButton("Add Test Balance 🧪", callback_data="admin_test_balance"),
+            InlineKeyboardButton("🧪 Add Test Balance | የሙከራ ቀሪ ሂሳብ", callback_data="admin_test_balance"),
         ],
     ])
 
@@ -620,9 +620,10 @@ def admin_keyboard():
 async def show_home(query):
     await query.edit_message_text(
         "💎 <b>Global Cash Bot</b>\n\n"
-        "Welcome! እዚህ ላይ በTasks እና Referral በመስራት "
-        "balance መሰብሰብ ይችላሉ።\n\n"
-        "Choose an option below 👇",
+        "Welcome! እዚህ በTasks እና Referral በመስራት "
+        "balance መሰብሰብ ይችላሉ።\n"
+        "You can earn ETB by completing tasks and referrals.\n\n"
+        "Choose an option below | ከታች ያለውን ይምረጡ 👇",
         reply_markup=main_keyboard(),
         parse_mode="HTML",
     )
@@ -632,10 +633,10 @@ async def show_balance(query, user_id):
     balance = get_balance(user_id)
 
     await query.edit_message_text(
-        "💰 <b>Your Balance</b>\n\n"
-        f"💵 Balance: <b>{balance:.2f} ETB</b>\n"
-        f"📌 Minimum Withdrawal: <b>{MIN_WITHDRAWAL:.2f} ETB</b>\n\n"
-        "Keep earning and withdraw when you reach the minimum.",
+        "💰 <b>Your Balance | የእርስዎ ቀሪ ሂሳብ</b>\n\n"
+        f"💵 Balance | ቀሪ ሂሳብ: <b>{balance:.2f} ETB</b>\n"
+        f"📌 Minimum Withdrawal | ዝቅተኛ ማውጫ: <b>{MIN_WITHDRAWAL:.2f} ETB</b>\n\n"
+        "Keep earning and withdraw when you reach the minimum. | ቀሪ ሂሳብዎ ዝቅተኛውን መጠን ሲደርስ ማውጣት ይችላሉ።",
         reply_markup=balance_keyboard(),
         parse_mode="HTML",
     )
@@ -648,7 +649,7 @@ async def show_referral(query, user_id):
     link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
 
     await query.edit_message_text(
-        "👥 <b>Referral Program</b>\n\n"
+        "👥 <b>Referral Program | የሪፈራል ፕሮግራም</b>\n\n"
         f"✅ Successful Referrals: <b>{count}</b>\n"
         f"🎁 Current Reward: <b>{reward:.2f} ETB</b> / successful referral\n\n"
         "Invite your friends using your personal link.\n"
@@ -683,12 +684,12 @@ async def show_tasks(query, user_id):
         ])
 
     buttons.append([
-        InlineKeyboardButton("🔙 Back", callback_data="home")
+        InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")
     ])
 
     await query.edit_message_text(
-        "🎯 <b>Available Tasks</b>\n\n"
-        "Complete a task and verify it to receive the reward.",
+        "🎯 <b>Available Tasks | ያሉ ተግባራት</b>\n\n"
+        "Complete a task and verify it to receive the reward. | ተግባሩን ጨርሰው Verify በማድረግ ሽልማቱን ይቀበሉ።",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode="HTML",
     )
@@ -706,7 +707,7 @@ async def show_wallet(query, user_id):
         wallet_text = "No wallet saved yet.\n\n"
 
     await query.edit_message_text(
-        "👛 <b>Wallet</b>\n\n"
+        "👛 <b>Wallet | ዋሌት</b>\n\n"
         + wallet_text +
         "Choose a method below. Saving another method will make it your active wallet.",
         reply_markup=wallet_keyboard(),
@@ -738,7 +739,7 @@ async def show_withdraw(query, user_id, context):
 
     if balance < MIN_WITHDRAWAL:
         await query.edit_message_text(
-            "💸 <b>Withdraw</b>\n\n"
+            "💸 <b>Withdraw | ገንዘብ አውጣ</b>\n\n"
             f"💰 Your Balance: <b>{balance:.2f} ETB</b>\n"
             f"📌 Minimum: <b>{MIN_WITHDRAWAL:.2f} ETB</b>\n\n"
             "ቢያንስ 30 ETB ሲደርስ withdrawal ማድረግ ይችላሉ።",
@@ -765,7 +766,7 @@ async def show_withdraw(query, user_id, context):
     context.user_data["withdraw_mode"] = True
 
     await query.edit_message_text(
-        "💸 <b>Withdraw</b>\n\n"
+        "💸 <b>Withdraw | ገንዘብ አውጣ</b>\n\n"
         f"💰 Available Balance: <b>{balance:.2f} ETB</b>\n"
         f"🏦 Method: <b>{escape(wallet[0])}</b>\n"
         f"🔢 Wallet: <code>{escape(wallet[1])}</code>\n\n"
@@ -778,7 +779,7 @@ async def show_withdraw(query, user_id, context):
 
 async def show_support(query):
     await query.edit_message_text(
-        "📢 <b>Advertising & Telegram Promotion</b>\n\n"
+        "📢 <b>Advertising & Telegram Promotion | ማስታወቂያ እና Telegram Promotion</b>\n\n"
         "We provide promotion services for:\n\n"
         "📣 Channel Promotion\n"
         "📈 Channel Growth\n"
@@ -1210,8 +1211,8 @@ def get_stats():
 
 async def show_admin(query):
     await query.edit_message_text(
-        "🛠 <b>Admin Panel</b>\n\n"
-        "Choose an option:",
+        "🛠 <b>Admin Panel | የአድሚን ፓነል</b>\n\n"
+        "Choose an option | አማራጭ ይምረጡ:",
         reply_markup=admin_keyboard(),
         parse_mode="HTML",
     )
@@ -1354,7 +1355,7 @@ async def show_admin_withdrawals(query):
         ])
 
     buttons.append([
-        InlineKeyboardButton("🔙 Back", callback_data="admin")
+        InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="admin")
     ])
 
     await query.edit_message_text(
@@ -1890,7 +1891,7 @@ async def show_task_detail(query, context, task_id):
 
     if paid:
         buttons = [
-            [InlineKeyboardButton("🔙 Back", callback_data="tasks")]
+            [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="tasks")]
         ]
     else:
         buttons = [
@@ -2185,7 +2186,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        "🛠 <b>Global Cash Admin Panel</b>",
+        "🛠 <b>Global Cash Admin Panel | የGlobal Cash አድሚን ፓነል</b>",
         reply_markup=admin_keyboard(),
         parse_mode="HTML",
     )
