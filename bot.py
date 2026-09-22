@@ -11,7 +11,6 @@ from telegram import (
     InlineKeyboardMarkup,
 )
 from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -86,7 +85,6 @@ def init_db():
                 referred_by INTEGER,
                 referral_paid INTEGER NOT NULL DEFAULT 0,
                 joined_all INTEGER NOT NULL DEFAULT 0,
-                suspicious INTEGER NOT NULL DEFAULT 0,
                 wallet_type TEXT,
                 wallet_number TEXT,
                 created_at TEXT NOT NULL
@@ -156,7 +154,7 @@ def is_admin(user_id):
 
 
 # ============================================================
-# USER & REFERRAL HELPERS
+# DATA HELPERS
 # ============================================================
 
 def get_user(user_id):
@@ -189,10 +187,6 @@ def get_balance(user_id):
     row = get_user(user_id)
     return float(row["balance"]) if row else 0.0
 
-def add_balance(user_id, amount):
-    with get_db_cursor() as cur:
-        cur.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, user_id))
-
 def get_wallet(user_id):
     row = get_user(user_id)
     if not row or not row["wallet_type"] or not row["wallet_number"]:
@@ -210,6 +204,10 @@ def get_referral_reward():
     row = conn.execute("SELECT value FROM settings WHERE key='referral_reward'").fetchone()
     conn.close()
     return float(row["value"]) if row else 2.0
+
+def set_referral_reward(new_reward):
+    with get_db_cursor() as cur:
+        cur.execute("UPDATE settings SET value=? WHERE key='referral_reward'", (str(new_reward),))
 
 def get_referral_count(user_id):
     conn = db()
@@ -277,7 +275,7 @@ def admin_keyboard():
 
 
 # ============================================================
-# USER FLOW HANDLERS
+# USER HANDLERS
 # ============================================================
 
 async def missing_channels(bot, user_id):
@@ -332,7 +330,7 @@ async def verify_channels_callback(query, context):
 
 
 # ============================================================
-# TASK & PROOF SUBMISSION (USER)
+# USER TASKS & PROOF HANDLER
 # ============================================================
 
 async def show_tasks(query, user_id):
@@ -382,7 +380,7 @@ async def show_user_task_detail(query, user_id, task_id, context):
 
 async def handle_photo_proof(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    photo = update.message.photo[-1]  # Highest resolution photo
+    photo = update.message.photo[-1]
 
     active_task_id = context.user_data.get("active_task_id")
 
@@ -393,7 +391,6 @@ async def handle_photo_proof(update: Update, context: ContextTypes.DEFAULT_TYPE)
     conn = db()
     task = conn.execute("SELECT * FROM tasks WHERE id=?", (active_task_id,)).fetchone()
     
-    # Save Proof
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO task_proofs (user_id, task_id, photo_id, status, created_at)
@@ -412,7 +409,6 @@ async def handle_photo_proof(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="HTML"
     )
 
-    # Notify Admin
     try:
         admin_buttons = InlineKeyboardMarkup([
             [
@@ -438,7 +434,7 @@ async def handle_photo_proof(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ============================================================
-# WITHDRAWAL FLOW
+# WITHDRAWAL PROCESS
 # ============================================================
 
 async def show_withdraw_start(query, user_id, context):
@@ -525,7 +521,7 @@ async def process_withdraw_final(query, context):
         """, (user.id, amount, wallet_type, wallet_number, "pending", now()))
         wd_id = cur.lastrowid
         conn.commit()
-    except Exception as e:
+    except Exception:
         conn.rollback()
         await query.edit_message_text("❌ Error processing request!")
         return
@@ -540,7 +536,6 @@ async def process_withdraw_final(query, context):
         parse_mode="HTML"
     )
 
-    # Prepare Detailed Referral Report for Admin
     ref_list = get_user_referrals_list(user.id)
     ref_text_lines = []
     for idx, r in enumerate(ref_list[:15], 1):
@@ -549,7 +544,6 @@ async def process_withdraw_final(query, context):
 
     ref_details = "\n".join(ref_text_lines) if ref_text_lines else "No Referrals found."
 
-    # Notify Admin with Referral Verification Details
     try:
         admin_text = (
             f"🚨 <b>NEW WITHDRAWAL REQUEST #{wd_id}</b>\n\n"
@@ -573,7 +567,7 @@ async def process_withdraw_final(query, context):
 
 
 # ============================================================
-# ADMIN CONTROL PANEL
+# FULL WORKING ADMIN PANEL
 # ============================================================
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -592,6 +586,7 @@ async def admin_callback_handler(query, context, data):
         await query.answer("⛔ Admin Only!", show_alert=True)
         return
 
+    # 1. STATISTICS BUTTON
     if data == "admin_stats":
         conn = db()
         u_count = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
@@ -610,6 +605,7 @@ async def admin_callback_handler(query, context, data):
     elif data == "admin_home":
         await query.edit_message_text("🛠 <b>Admin Control Panel</b>", reply_markup=admin_keyboard(), parse_mode="HTML")
 
+    # 2. WITHDRAWALS BUTTON
     elif data == "admin_withdrawals":
         conn = db()
         rows = conn.execute("SELECT * FROM withdrawals WHERE status='pending' ORDER BY id DESC").fetchall()
@@ -630,6 +626,7 @@ async def admin_callback_handler(query, context, data):
             ])
             await context.bot.send_message(chat_id=ADMIN_ID, text=text, reply_markup=btns, parse_mode="HTML")
 
+    # 3. ADD TASK BUTTON
     elif data == "admin_add_task":
         context.user_data["admin_step"] = "task_title"
         await query.edit_message_text(
@@ -637,6 +634,77 @@ async def admin_callback_handler(query, context, data):
             parse_mode="HTML"
         )
 
+    # 4. VERIFY TASK PROOFS BUTTON
+    elif data == "admin_proofs":
+        conn = db()
+        proofs = conn.execute("SELECT * FROM task_proofs WHERE status='pending' ORDER BY id ASC LIMIT 5").fetchall()
+        conn.close()
+
+        if not proofs:
+            await query.edit_message_text("📥 <b>No Pending Task Proofs!</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back 🔙", callback_data="admin_home")]]), parse_mode="HTML")
+            return
+
+        await query.edit_message_text(f"📥 Found {len(proofs)} pending proofs. Sending below...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back 🔙", callback_data="admin_home")]]))
+
+        for p in proofs:
+            conn = db()
+            task = conn.execute("SELECT * FROM tasks WHERE id=?", (p["task_id"],)).fetchone()
+            user = conn.execute("SELECT * FROM users WHERE user_id=?", (p["user_id"],)).fetchone()
+            conn.close()
+
+            uname = f"@{user['username']}" if user and user['username'] else "N/A"
+            btns = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Approve Task ✅", callback_data=f"approve_proof_{p['id']}"),
+                    InlineKeyboardButton("Reject Task ❌", callback_data=f"reject_proof_{p['id']}")
+                ]
+            ])
+            try:
+                await context.bot.send_photo(
+                    chat_id=ADMIN_ID,
+                    photo=p["photo_id"],
+                    caption=f"📥 Proof #{p['id']}\n👤 User: {uname} (<code>{p['user_id']}</code>)\n🎯 Task: {task['title'] if task else 'N/A'}",
+                    reply_markup=btns,
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Error displaying proof #{p['id']}: {e}")
+
+    # 5. TOP REFERRERS BUTTON
+    elif data == "admin_referrals":
+        conn = db()
+        top_users = conn.execute("""
+            SELECT referrer_id, COUNT(*) as ref_count 
+            FROM referrals 
+            WHERE status='paid' 
+            GROUP BY referrer_id 
+            ORDER BY ref_count DESC 
+            LIMIT 10
+        """).fetchall()
+        conn.close()
+
+        if not top_users:
+            await query.edit_message_text("👥 <b>No Referrals Found Yet!</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back 🔙", callback_data="admin_home")]]), parse_mode="HTML")
+            return
+
+        lines = ["👥 <b>Top 10 Referrers:</b>\n"]
+        for idx, u in enumerate(top_users, 1):
+            user_info = get_user(u["referrer_id"])
+            uname = f"@{user_info['username']}" if user_info and user_info['username'] else f"User {u['referrer_id']}"
+            lines.append(f"{idx}. {escape(uname)} — <b>{u['ref_count']} Invites</b>")
+
+        await query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Back 🔙", callback_data="admin_home")]), parse_mode="HTML")
+
+    # 6. SET REFERRAL REWARD BUTTON
+    elif data == "admin_reward":
+        context.user_data["admin_step"] = "set_reward"
+        curr = get_referral_reward()
+        await query.edit_message_text(
+            f"💰 <b>Set Referral Reward</b>\n\nCurrent Reward Per Invite: <b>{curr:.2f} ETB</b>\n\nአዲስ የሪፈራል ክፍያ መጠን በቁጥር ያስገቡ (ምሳሌ፦ 3.00)፦",
+            parse_mode="HTML"
+        )
+
+    # APPROVE/REJECT WITHDRAW ACTIONS
     elif data.startswith("adm_app_wd_"):
         wd_id = int(data.split("_")[-1])
         conn = db()
@@ -681,6 +749,7 @@ async def admin_callback_handler(query, context, data):
         txt = "\n".join(lines) if refs else "No referrals found!"
         await context.bot.send_message(chat_id=ADMIN_ID, text=txt, parse_mode="HTML")
 
+    # APPROVE/REJECT PROOF ACTIONS
     elif data.startswith("approve_proof_"):
         proof_id = int(data.split("_")[-1])
         conn = db()
@@ -718,7 +787,7 @@ async def admin_callback_handler(query, context, data):
 
 
 # ============================================================
-# BROADCAST & TASK CREATION PROCESS
+# BROADCAST FUNCTION
 # ============================================================
 
 async def broadcast_new_task(context, task_title, task_url, reward):
@@ -742,7 +811,7 @@ async def broadcast_new_task(context, task_title, task_url, reward):
 
 
 # ============================================================
-# MAIN CALLBACK & MESSAGE ROUTING
+# MAIN CALLBACK & MESSAGE ROUTER
 # ============================================================
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -826,9 +895,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip() if update.message.text else ""
 
-    # ADMIN TASK CREATION STEPS
+    # ADMIN INPUT STEPS
     if is_admin(user.id) and "admin_step" in context.user_data:
         step = context.user_data["admin_step"]
+
+        if step == "set_reward":
+            try:
+                new_r = float(text)
+                set_referral_reward(new_r)
+                context.user_data.clear()
+                await update.message.reply_text(f"✅ <b>Referral Reward Updated to {new_r:.2f} ETB!</b>", parse_mode="HTML")
+            except ValueError:
+                await update.message.reply_text("❌ እባክዎን ትክክለኛ ቁጥር ያስገቡ!")
+            return
 
         if step == "task_title":
             context.user_data["new_task_title"] = text
@@ -871,7 +950,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await broadcast_new_task(context, title, url, reward)
             return
 
-    # WALLET SAVING STEP
+    # WALLET INPUT STEP
     if context.user_data.get("wallet_step") == "number":
         w_type = context.user_data.get("wallet_type")
         set_wallet(user.id, w_type, text)
@@ -879,7 +958,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ <b>{w_type} Wallet Saved!</b>", reply_markup=main_keyboard(), parse_mode="HTML")
         return
 
-    # WITHDRAW AMOUNT STEP
+    # WITHDRAW INPUT STEP
     if context.user_data.get("withdraw_step") == "amount":
         await handle_withdraw_amount_text(update, context)
         return
@@ -888,7 +967,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# APPLICATION MAIN ENTRY
+# MAIN APPLICATION STARTUP
 # ============================================================
 
 def main():
