@@ -539,15 +539,15 @@ def channel_keyboard(missing):
 def main_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💰 Balance | ቀሪ", callback_data="balance"),
-            InlineKeyboardButton("👥 Referral | ሪፈራል", callback_data="referral"),
+            InlineKeyboardButton("💰 Balance | ሂሳብ", callback_data="balance"),
+            InlineKeyboardButton("👥 Referral | ግብዣ", callback_data="referral"),
         ],
         [
-            InlineKeyboardButton("🎯 Tasks | ተግባር", callback_data="tasks"),
-            InlineKeyboardButton("💸 Withdraw | ማውጣት", callback_data="withdraw"),
+            InlineKeyboardButton("🎯 Tasks | ተግባሮች", callback_data="tasks"),
+            InlineKeyboardButton("💸 Withdraw | ገንዘብ አውጣ", callback_data="withdraw"),
         ],
         [
-            InlineKeyboardButton("👛 Wallet | ዋሌት", callback_data="wallet"),
+            InlineKeyboardButton("👛 Wallet | የክፍያ መረጃ", callback_data="wallet"),
             InlineKeyboardButton("📞 Support | ድጋፍ", callback_data="support"),
         ],
     ])
@@ -562,8 +562,8 @@ def back_keyboard():
 def balance_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("💸 Withdraw | ማውጣት", callback_data="withdraw"),
-            InlineKeyboardButton("👥 Referral | ሪፈራል", callback_data="referral"),
+            InlineKeyboardButton("💸 Withdraw | ገንዘብ አውጣ", callback_data="withdraw"),
+            InlineKeyboardButton("👥 Referral | ግብዣ", callback_data="referral"),
         ],
         [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")],
     ])
@@ -579,8 +579,8 @@ def referral_keyboard():
 def wallet_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🏦 CBE | ንግድ ባንክ", callback_data="wallet_cbe"),
-            InlineKeyboardButton("📱 Telebirr | ቴሌብር", callback_data="wallet_telebirr"),
+            InlineKeyboardButton("🏦 CBE | ሂሳብ", callback_data="wallet_cbe"),
+            InlineKeyboardButton("📱 Telebirr | ስልክ", callback_data="wallet_telebirr"),
         ],
         [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")],
     ])
@@ -588,7 +588,7 @@ def wallet_keyboard():
 
 def withdraw_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👛 Set / Change Wallet | ዋሌት ቀይር", callback_data="wallet")],
+        [InlineKeyboardButton("👛 Set / Change Wallet | ዋሌት አስቀምጥ/ቀይር", callback_data="wallet")],
         [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="home")],
     ])
 
@@ -608,7 +608,10 @@ def admin_keyboard():
             InlineKeyboardButton("🎯 Add Task | ተግባር ጨምር", callback_data="admin_add_task"),
         ],
         [
-            InlineKeyboardButton("🧪 Test Balance | የሙከራ ቀሪ", callback_data="admin_test_balance"),
+            InlineKeyboardButton("🧪 Add Test Balance | የሙከራ ሂሳብ", callback_data="admin_test_balance"),
+        ],
+        [
+            InlineKeyboardButton("🔎 Check User Balance | ሂሳብ ፈትሽ", callback_data="admin_check_balance"),
         ],
     ])
 
@@ -620,10 +623,9 @@ def admin_keyboard():
 async def show_home(query):
     await query.edit_message_text(
         "💎 <b>Global Cash Bot</b>\n\n"
-        "Welcome! እዚህ በTasks እና Referral በመስራት "
-        "balance መሰብሰብ ይችላሉ።\n"
-        "You can earn ETB by completing tasks and referrals.\n\n"
-        "Choose an option below | ከታች ያለውን ይምረጡ 👇",
+        "Welcome! Complete Tasks and invite friends to earn ETB.\n"
+        "Tasks እና referrals በመጠቀም balance ይሰብስቡ።\n\n"
+        "Choose an option below 👇",
         reply_markup=main_keyboard(),
         parse_mode="HTML",
     )
@@ -649,11 +651,11 @@ async def show_referral(query, user_id):
     link = f"https://t.me/{BOT_USERNAME}?start={user_id}"
 
     await query.edit_message_text(
-        "👥 <b>Referral Program | የሪፈራል ፕሮግራም</b>\n\n"
-        f"✅ Successful Referrals: <b>{count}</b>\n"
-        f"🎁 Current Reward: <b>{reward:.2f} ETB</b> / successful referral\n\n"
-        "Invite your friends using your personal link.\n"
-        "The reward is paid after the referred user completes verification.\n\n"
+        "👥 <b>Referral Program | የግብዣ ፕሮግራም</b>\n\n"
+        f"👥 Successful Referrals: <b>{count}</b>\n"
+        f"🎁 Reward per referral: <b>{reward:.2f} ETB</b>\n\n"
+        "Invite friends with your personal link and earn rewards.\n"
+        "Reward የሚገባው referred user ሙሉ verification ካጠናቀቀ በኋላ ነው።\n\n"
         f"🔗 <code>{escape(link)}</code>",
         reply_markup=referral_keyboard(),
         parse_mode="HTML",
@@ -798,7 +800,7 @@ async def show_support(query):
             ],
             [
                 InlineKeyboardButton(
-                    "🔙 Back",
+                    "🔙 Back | ተመለስ",
                     callback_data="home",
                 )
             ],
@@ -834,10 +836,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_joined_all(user.id, False)
 
         await update.message.reply_text(
-            "💎 <b>Welcome to Global Cash Bot</b>\n\n"
-            "To continue, please verify all required channels below.\n\n"
-            "ከታች ያሉትን ሁሉንም channels ከተቀላቀሉ "
-            "በኋላ <b>Verify</b> ይጫኑ።",
+            "💎 <b>Welcome to Global Cash Bot | እንኳን ደህና መጡ</b>\n\n"
+            "To continue, join all required channels below.\n"
+            "ከታች ያሉትን channels ሁሉ ከተቀላቀሉ በኋላ Verify ያድርጉ።",
             reply_markup=channel_keyboard(missing),
             parse_mode="HTML",
         )
@@ -1401,7 +1402,7 @@ async def show_admin_withdrawal_detail(query, withdrawal_id):
 
     buttons.append([
         InlineKeyboardButton(
-            "🔙 Back",
+            "🔙 Back | ተመለስ",
             callback_data="admin_withdrawals",
         )
     ])
@@ -1608,6 +1609,85 @@ async def show_admin_suspicious(query):
         reply_markup=back_keyboard(),
         parse_mode="HTML",
     )
+
+
+
+# ============================================================
+# ADMIN USER BALANCE CHECK
+# ============================================================
+
+async def start_check_balance(query, context):
+    if not admin_only(query.from_user.id):
+        return
+
+    context.user_data.clear()
+    context.user_data["admin_step"] = "check_balance_user"
+
+    await query.edit_message_text(
+        "🔎 <b>Check User Balance | የተጠቃሚ ሂሳብ ፈትሽ</b>\n\n"
+        "Enter the Telegram User ID you want to check.\n"
+        "የምትፈትሹትን Telegram User ID ያስገቡ።\n\n"
+        "Example: <code>8727153413</code>",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel | ሰርዝ", callback_data="admin")]
+        ]),
+        parse_mode="HTML",
+    )
+
+
+async def handle_admin_check_balance(update, context):
+    if context.user_data.get("admin_step") != "check_balance_user":
+        return False
+
+    text = (update.message.text or "").strip()
+
+    try:
+        target_user_id = int(text)
+        if target_user_id <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid User ID.\n\n"
+            "Please enter a valid Telegram User ID.\n"
+            "ትክክለኛ Telegram User ID ያስገቡ።\n\n"
+            "Example: <code>8727153413</code>",
+            parse_mode="HTML",
+        )
+        return True
+
+    target = get_user(target_user_id)
+    context.user_data.clear()
+
+    if not target:
+        await update.message.reply_text(
+            "❌ <b>User Not Found</b>\n\n"
+            f"User ID <code>{target_user_id}</code> is not registered in the bot.\n"
+            "ተጠቃሚው በBot ላይ /start አላደረገም።",
+            reply_markup=admin_keyboard(),
+            parse_mode="HTML",
+        )
+        return True
+
+    username = f"@{target['username']}" if target["username"] else "N/A"
+    wallet = get_wallet(target_user_id)
+
+    wallet_text = (
+        f"{wallet[0]} — <code>{escape(wallet[1])}</code>"
+        if wallet else "Not set | አልተቀመጠም"
+    )
+
+    await update.message.reply_text(
+        "🔎 <b>User Balance Check | የተጠቃሚ ሂሳብ</b>\n\n"
+        f"👤 User ID: <code>{target_user_id}</code>\n"
+        f"📱 Username: {escape(username)}\n"
+        f"💰 Balance: <b>{float(target['balance']):.2f} ETB</b>\n"
+        f"👛 Wallet: {wallet_text}\n"
+        f"✅ Verified: <b>{'Yes' if target['joined_all'] else 'No'}</b>\n"
+        f"⚠️ Security: <b>{'Review' if target['suspicious'] else 'Clear'}</b>",
+        reply_markup=admin_keyboard(),
+        parse_mode="HTML",
+    )
+    return True
 
 
 # ============================================================
@@ -1909,7 +1989,7 @@ async def show_task_detail(query, context, task_id):
             ],
             [
                 InlineKeyboardButton(
-                    "🔙 Back",
+                    "🔙 Back | ተመለስ",
                     callback_data="tasks",
                 )
             ],
@@ -2033,12 +2113,22 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data == "share_ref":
             link = f"https://t.me/{BOT_USERNAME}?start={user.id}"
+            share_url = (
+                "https://t.me/share/url"
+                f"?url={link}"
+                "&text=Join%20Global%20Cash%20Bot%20and%20start%20earning%20ETB!"
+            )
 
             await query.edit_message_text(
-                "📤 <b>Share Your Referral Link</b>\n\n"
-                f"<code>{escape(link)}</code>\n\n"
-                "Copy the link and share it with your friends.",
-                reply_markup=referral_keyboard(),
+                "📤 <b>Share Your Referral Link | የግብዣ ሊንክ</b>\n\n"
+                "Share your personal link with friends and earn rewards.\n"
+                "ወዳጆችዎን በመጋበዝ reward ያግኙ።\n\n"
+                f"🔗 <code>{escape(link)}</code>\n\n"
+                "Tap <b>Share Again</b> to send it directly to another person.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Share Again | ድጋሚ አጋራ", url=share_url)],
+                    [InlineKeyboardButton("🔙 Back | ተመለስ", callback_data="referral")],
+                ]),
                 parse_mode="HTML",
             )
             return
@@ -2141,6 +2231,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await start_test_balance(query, context)
             return
 
+        if data == "admin_check_balance":
+            await start_check_balance(query, context)
+            return
+
         if data.startswith("approve_wd_"):
             withdrawal_id = int(data.split("_")[-1])
             await approve_withdrawal(
@@ -2231,6 +2325,9 @@ async def message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if await handle_admin_test_balance(update, context):
+            return
+
+        if await handle_admin_check_balance(update, context):
             return
 
     # Wallet input.
