@@ -639,8 +639,36 @@ async def callback(update, ctx):
             f"🎯 <b>{escape(t['title'])}</b>\n\n{escape(t['description'])}\n\n💰 <b>{t['reward']:.2f} ETB</b>",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("📢 Join Channel", url=t["channel_url"])],
+                [InlineKeyboardButton("✅ Verify Task", callback_data=f"taskverify:{tid}")],
                 [InlineKeyboardButton("🔙 Back", callback_data="tasks")]
             ]), parse_mode="HTML"); return
+
+    if d.startswith("taskverify:"):
+        tid = int(d.split(":")[1])
+        c = db(); t = c.execute("SELECT * FROM tasks WHERE id=? AND active=1", (tid,)).fetchone(); c.close()
+        if not t:
+            await q.answer("Task unavailable.", show_alert=True); return
+        try:
+            m = await ctx.bot.get_chat_member(t["channel_username"], uid)
+            joined = m.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+        except Exception:
+            joined = False
+        if not joined:
+            await q.answer("❌ Join the channel first.", show_alert=True); return
+        c = db()
+        row = c.execute("SELECT * FROM user_tasks WHERE user_id=? AND task_id=?", (uid, tid)).fetchone()
+        if row and row["paid"]:
+            c.close(); await q.answer("Already rewarded.", show_alert=True); return
+        if row:
+            c.execute("UPDATE user_tasks SET verified=1 WHERE user_id=? AND task_id=?", (uid, tid))
+        else:
+            c.execute("INSERT INTO user_tasks(user_id,task_id,verified,paid) VALUES(?,?,1,0)", (uid, tid))
+        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (t["reward"], uid))
+        c.execute("UPDATE user_tasks SET paid=1,paid_at=? WHERE user_id=? AND task_id=?", (now(), uid, tid))
+        c.commit(); c.close()
+        await q.answer(f"+{t['reward']:.2f} ETB added", show_alert=True)
+        await q.edit_message_text(f"✅ <b>Task Verified!</b>\n\n🎁 Reward: <b>{t['reward']:.2f} ETB</b>\n💰 Added to your balance.", reply_markup=back_kb("tasks"), parse_mode="HTML")
+        return
 
     # Admin
     if d == "admin":
