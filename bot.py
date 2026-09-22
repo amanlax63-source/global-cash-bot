@@ -3385,6 +3385,103 @@ def main():
     application.run_polling(
         allowed_updates=Update.ALL_TYPES
     )
+    
+if __name__ == "__main__":
+    main()
+import os
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    ADMIN_ID_RAW = os.getenv("ADMIN_ID")
+
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN is not configured in Railway Variables."
+        )
+
+    if not ADMIN_ID_RAW:
+        raise RuntimeError(
+            "ADMIN_ID is not configured in Railway Variables."
+        )
+
+    try:
+        ADMIN_ID = int(ADMIN_ID_RAW)
+    except ValueError:
+        raise RuntimeError(
+            "ADMIN_ID must be a numeric Telegram User ID."
+        )
+
+    # Make ADMIN_ID available to functions that use the global variable
+    globals()["ADMIN_ID"] = ADMIN_ID
+
+    # Initialize database
+    init_db()
+
+    # Create Telegram application
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .build()
+    )
+
+    # ========================================================
+    # COMMANDS
+    # ========================================================
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("admin", admin_command)
+    )
+
+    application.add_handler(
+        CommandHandler("cancel", cancel)
+    )
+
+    # ========================================================
+    # CALLBACK BUTTONS
+    # ========================================================
+
+    application.add_handler(
+        CallbackQueryHandler(callbacks)
+    )
+
+    # ========================================================
+    # TEXT MESSAGES
+    # ========================================================
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text
+        )
+    )
+
+    # ========================================================
+    # ERROR HANDLER
+    # ========================================================
+
+    application.add_error_handler(error_handler)
+
+    # ========================================================
+    # START BOT
+    # ========================================================
+
+    print("========================================")
+    print("Global Cash Bot is starting...")
+    print(f"Admin ID: {ADMIN_ID}")
+    print("Bot polling started.")
+    print("========================================")
+
+    application.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
